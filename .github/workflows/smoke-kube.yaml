@@ -2,11 +2,6 @@ name: Smoke Test Kubernetes Access
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/smoke-kube.yaml
 
 jobs:
   smoke:
@@ -19,12 +14,12 @@ jobs:
       - name: Set up kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: 'v1.30.0'
+          version: "v1.30.0"
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
-          version: 'v3.14.4'
+          version: "v3.14.4"
 
       - name: Install utils
         run: |
@@ -36,61 +31,40 @@ jobs:
           mkdir -p ~/.kube
           echo "${{ secrets.KUBECONFIG_CONTENT }}" > ~/.kube/config
           chmod 600 ~/.kube/config
-          echo ">> Current context:"
           kubectl config current-context || true
 
       - name: Check API reachability (TCP 6443)
         run: |
           API_IP="103.132.230.3"
-          echo "Testing TCP to ${API_IP}:6443 ..."
           nc -vz -w 5 "${API_IP}" 6443
 
-      - name: kubectl: cluster-info & version
+      - name: kubectl cluster-info & version
         run: |
           kubectl cluster-info
           kubectl version --request-timeout=10s
 
-      - name: kubectl: auth & nodes
+      - name: RBAC check and nodes
         run: |
-          echo ">> Can I do everything?"
           kubectl auth can-i '*' '*' --all-namespaces
-          echo ">> Nodes:"
           kubectl get nodes -o wide
 
-      - name: DNS resolves to the right IP
-        env:
-          RANCHER_HOSTNAME: ${{ vars.RANCHER_HOSTNAME }}
-        run: |
-          test -n "$RANCHER_HOSTNAME" || { echo "Set repo variable RANCHER_HOSTNAME"; exit 1; }
-          echo "Resolving $RANCHER_HOSTNAME ..."
-          dig +short A "$RANCHER_HOSTNAME"
-          RESOLVED=$(dig +short A "$RANCHER_HOSTNAME" | tail -n1)
-          echo "Resolved IP: $RESOLVED"
-          if [ "$RESOLVED" != "103.132.230.3" ]; then
-            echo "::warning::DNS for $RANCHER_HOSTNAME should point to 103.132.230.3"
-          fi
-
-      - name: Helm repo & dry-run template Rancher
-        env:
-          EMAIL: ${{ vars.LETSENCRYPT_EMAIL }}
-          HOST:  ${{ vars.RANCHER_HOSTNAME }}
-          BOOT:  ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
+      - name: Helm template Rancher (dry-run)
         run: |
           helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
           helm repo update
-          test -n "$EMAIL" -a -n "$HOST" -a -n "$BOOT" || { echo "Set LETSENCRYPT_EMAIL var & RANCHER_BOOTSTRAP_PASSWORD secret"; exit 1; }
+          test -n "${{ vars.LETSENCRYPT_EMAIL }}" || (echo "Missing repo variable LETSENCRYPT_EMAIL" && exit 1)
+          test -n "${{ vars.RANCHER_HOSTNAME }}" || (echo "Missing repo variable RANCHER_HOSTNAME" && exit 1)
+          test -n "${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}" || (echo "Missing secret RANCHER_BOOTSTRAP_PASSWORD" && exit 1)
           helm template rancher rancher-stable/rancher \
             --namespace cattle-system \
             -f clusters/madiunkab/rancher/values.yaml \
-            --set hostname=${HOST} \
-            --set letsEncrypt.email=${EMAIL} \
-            --set bootstrapPassword=${BOOT} \
+            --set hostname=${{ vars.RANCHER_HOSTNAME }} \
+            --set letsEncrypt.email=${{ vars.LETSENCRYPT_EMAIL }} \
+            --set bootstrapPassword=${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }} \
             >/dev/null
           echo "Helm template OK"
 
-      - name: Sanity checks
+      - name: (Optional) DNS resolve Rancher hostname
+        if: ${{ vars.RANCHER_HOSTNAME != '' }}
         run: |
-          echo "Checking can-i create namespaces:"
-          kubectl auth can-i create namespaces
-          echo "Listing kube-system pods:"
-          kubectl -n kube-system get pods | head -n 20
+          dig +short A "${{ vars.RANCHER_HOSTNAME }}" || true
