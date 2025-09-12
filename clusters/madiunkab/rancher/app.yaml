@@ -1,0 +1,12 @@
+name: rancher
+namespace: cattle-system
+chart: rancher
+repo: https://releases.rancher.com/server-charts/stable
+version: "" # kosong = versi stable terbaru
+requires:
+  certManager: true # pasang cert-manager dulu
+special:
+  inject:
+    hostnameFromVar: RANCHER_HOSTNAME
+    emailFromVar: LETSENCRYPT_EMAIL
+    bootstrapPasswordFromSecret: RANCHER_BOOTSTRAP_PASSWORD

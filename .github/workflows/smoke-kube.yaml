@@ -1,0 +1,94 @@
+name: Smoke Test Kubernetes Access
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/smoke-kube.yaml"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Tooling
+        uses: azure/setup-kubectl@v4
+        with: { version: 'v1.30.0' }
+      - uses: azure/setup-helm@v4
+        with: { version: 'v3.14.4' }
+      - name: Install utils
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq dnsutils netcat-openbsd
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_CONTENT }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+          echo ">> Current context:"
+          kubectl config current-context || true
+
+      # --- KUBE API reachability & auth ---
+      - name: Check API reachability (TCP 6443)
+        run: |
+          API_IP="103.132.230.3"
+          echo "Testing TCP to ${API_IP}:6443 ..."
+          nc -vz -w 5 "${API_IP}" 6443
+
+      - name: kubectl: cluster-info & version
+        run: |
+          kubectl cluster-info
+          kubectl version --request-timeout=10s
+
+      - name: kubectl: auth & nodes
+        run: |
+          echo ">> Who am I?"
+          kubectl auth can-i '*' '*' --all-namespaces
+          echo ">> Nodes:"
+          kubectl get nodes -o wide
+
+      # --- DNS Rancher & TLS prereq ---
+      - name: DNS resolves to the right IP
+        env:
+          RANCHER_HOSTNAME: ${{ vars.RANCHER_HOSTNAME }}
+        run: |
+          test -n "$RANCHER_HOSTNAME" || { echo "Set repo variable RANCHER_HOSTNAME"; exit 1; }
+          echo "Resolving $RANCHER_HOSTNAME ..."
+          dig +short A "$RANCHER_HOSTNAME"
+          RESOLVED=$(dig +short A "$RANCHER_HOSTNAME" | tail -n1)
+          echo "Resolved IP: $RESOLVED"
+          if [ "$RESOLVED" != "103.132.230.3" ]; then
+            echo "::warning::DNS for $RANCHER_HOSTNAME should point to 103.132.230.3"
+          fi
+
+      # --- Helm dry-run Rancher (tanpa install) ---
+      - name: Helm repo & dry-run template Rancher
+        env:
+          EMAIL: ${{ vars.LETSENCRYPT_EMAIL }}
+          HOST:  ${{ vars.RANCHER_HOSTNAME }}
+          BOOT:  ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
+        run: |
+          helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+          helm repo update
+          test -n "$EMAIL" -a -n "$HOST" -a -n "$BOOT" || { echo "Set LETSENCRYPT_EMAIL var & RANCHER_BOOTSTRAP_PASSWORD secret"; exit 1; }
+          helm template rancher rancher-stable/rancher \
+            --namespace cattle-system \
+            -f clusters/madiunkab/rancher/values.yaml \
+            --set hostname=${HOST} \
+            --set letsEncrypt.email=${EMAIL} \
+            --set bootstrapPassword=${BOOT} \
+            >/dev/null
+          echo "Helm template OK"
+
+      # --- (Opsional) cek izin buat create ns & list pods ---
+      - name: Sanity create/delete (dry) statements
+        run: |
+          echo "Checking can-i create namespaces:"
+          kubectl auth can-i create namespaces
+          echo "Listing kube-system pods:"
+          kubectl -n kube-system get pods | head -n 20
