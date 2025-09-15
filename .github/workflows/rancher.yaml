@@ -1,4 +1,4 @@
-name: Deploy Rancher (TLS via NPM)
+name: Deploy Rancher (TLS internal / self-signed)
 
 on:
   workflow_dispatch:
@@ -22,8 +22,7 @@ on:
 
 jobs:
   deploy-rancher:
-    # pakai self-hosted runner? ganti ke self-hosted
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # ganti ke self-hosted kalau perlu
     env:
       KUBE_CONTEXT: ${{ inputs.kube_context }}
       RANCHER_HOSTNAME: ${{ inputs.rancher_hostname }}
@@ -63,18 +62,10 @@ jobs:
           chmod 600 $HOME/.kube/config
 
           kubectl config use-context "$KUBE_CONTEXT" || true
-
-          echo "== kubectl client version =="
-          kubectl version --client=true -o yaml || kubectl version --client=true || kubectl version
-
-          echo "== cluster info =="
-          kubectl cluster-info || true
-
-          echo "== apiserver readiness (best-effort) =="
-          kubectl get --raw=/readyz?verbose || true
-
-          echo "== nodes =="
-          kubectl get nodes -o wide
+          echo "== kubectl client version =="; kubectl version --client=true -o yaml || kubectl version --client=true || kubectl version
+          echo "== cluster info =="; kubectl cluster-info || true
+          echo "== apiserver readiness =="; kubectl get --raw=/readyz?verbose || true
+          echo "== nodes =="; kubectl get nodes -o wide
 
       - name: Add Helm repo (Rancher)
         run: |
@@ -85,20 +76,18 @@ jobs:
         run: |
           kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
-      - name: Install/Upgrade Rancher (TLS terminated at NPM)
+      - name: Install/Upgrade Rancher (TLS self-signed at Ingress)
         env:
           BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
         run: |
           set -euo pipefail
-
-          # TLS off di cluster: biar HTTP-only, NPM yang terminate HTTPS
-          # Tambah beberapa annotation yang umum dipakai (opsional)
+          # TLS internal aktif di Ingress (self-signed)
           helm upgrade --install rancher rancher-latest/rancher \
             --namespace cattle-system \
             --set hostname="${RANCHER_HOSTNAME}" \
-            --set ingress.tls.source=none \
             --set ingress.ingressClassName="${INGRESS_CLASS}" \
-            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-read-timeout"="3600" \
+            --set ingress.tls.source=rancher \
+            --set-string ingress.extraAnnotations."nginx\.insress\.kubernetes\.io/proxy-read-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-send-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="20m" \
             ${BOOTSTRAP_PASSWORD:+--set bootstrapPassword="${BOOTSTRAP_PASSWORD}"} \
@@ -110,4 +99,4 @@ jobs:
       - name: Show Rancher objects
         run: |
           kubectl -n cattle-system get deploy,svc,ingress -o wide
-          echo "Rancher URL (via NPM): https://${RANCHER_HOSTNAME}"
+          echo "Rancher URL (via NPM -> upstream HTTPS): https://${RANCHER_HOSTNAME}"
