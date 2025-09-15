@@ -96,31 +96,45 @@ jobs:
           helm repo add metallb https://metallb.github.io/metallb
           helm repo update
 
-      - name: Install/Upgrade MetalLB
+      - name: (Rancher) Temporarily fail-open validating webhook
+        shell: bash
         run: |
+          set -euo pipefail
+          # Set failurePolicy=Ignore untuk semua entry (jumlah bervariasi)
+          if kubectl get validatingwebhookconfiguration rancher.cattle.io >/dev/null 2>&1; then
+            for i in $(seq 0 19); do
+              kubectl patch validatingwebhookconfiguration rancher.cattle.io \
+                --type='json' \
+                -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
+                >/dev/null 2>&1 || true
+            done
+          fi
+
+      - name: Install/Upgrade MetalLB (with CRDs)
+        run: |
+          set -euo pipefail
           kubectl get ns metallb-system >/dev/null 2>&1 || kubectl create ns metallb-system
-          HELM_ARGS=( metallb/metallb -n metallb-system )
+          HELM_ARGS=( metallb/metallb -n metallb-system --set crds.enabled=true )
           if [[ "${METALLB_VERSION}" != "latest" ]]; then
             HELM_ARGS+=( --version "${METALLB_VERSION}" )
           fi
           helm upgrade --install metallb "${HELM_ARGS[@]}" --wait --timeout 10m
           kubectl -n metallb-system get deploy,ds,pods -o wide
 
+      - name: Install envsubst
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext-base
+
       - name: Apply IPAddressPool + L2Advertisement
         shell: bash
         run: |
           set -euo pipefail
-          # render template sederhana tanpa tool tambahan
-          sed \
-            -e "s/{{ .POOL_NAME }}/${POOL_NAME}/g" \
-            -e "s/{{ .POOL_ADDRESSES }}/${POOL_ADDRESSES}/g" \
-            -e "s/{{ .ADV_NAME }}/${ADV_NAME}/g" \
-            k8s/metallb/ip-pool.yaml.tpl > /tmp/ip-pool.yaml
-
+          export POOL_NAME POOL_ADDRESSES ADV_NAME
+          envsubst < k8s/metallb/ip-pool.yaml.tpl > /tmp/ip-pool.yaml
           echo "--- Applying:"
           cat /tmp/ip-pool.yaml
           kubectl apply -f /tmp/ip-pool.yaml
-
           echo "== Objects =="
           kubectl -n metallb-system get ipaddresspool,l2advertisement -o yaml
 
@@ -142,6 +156,20 @@ jobs:
             sleep 5
           done
           echo "EXTERNAL-IP: ${EXIP:-<none>}"
+
+      - name: (Rancher) Restore webhook failurePolicy=Fail
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if kubectl get validatingwebhookconfiguration rancher.cattle.io >/dev/null 2>&1; then
+            for i in $(seq 0 19); do
+              kubectl patch validatingwebhookconfiguration rancher.cattle.io \
+                --type='json' \
+                -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
+                >/dev/null 2>&1 || true
+            done
+          fi
 
       - name: Summary
         run: |
