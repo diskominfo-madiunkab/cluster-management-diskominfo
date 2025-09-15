@@ -1,6 +1,10 @@
-name: Deploy Rancher (Cloudflare + NPM, TLS internal/self-signed)
+name: Deploy Rancher (Cloudflare+NPM → Ingress TLS internal)
 
 on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/deploy-rancher.yml"
   workflow_dispatch:
     inputs:
       rancher_hostname:
@@ -8,9 +12,13 @@ on:
         required: true
         default: "k8s.madiunkab.go.id"
       ingress_class:
-        description: "Ingress class di cluster (nginx/traefik/haproxy, dll.)"
+        description: "Ingress class (nginx/traefik/haproxy, dll.)"
         required: true
         default: "nginx"
+      ingress_namespace:
+        description: "Namespace Ingress Controller (default: ingress-nginx)"
+        required: true
+        default: "ingress-nginx"
       rancher_version:
         description: "Chart version (atau 'latest')"
         required: true
@@ -27,6 +35,7 @@ jobs:
       KUBE_CONTEXT: ${{ inputs.kube_context }}
       RANCHER_HOSTNAME: ${{ inputs.rancher_hostname }}
       INGRESS_CLASS: ${{ inputs.ingress_class }}
+      INGRESS_NS: ${{ inputs.ingress_namespace }}
       RANCHER_VERSION: ${{ inputs.rancher_version }}
 
     steps:
@@ -42,6 +51,11 @@ jobs:
         uses: azure/setup-helm@v4
         with:
           version: "latest"
+
+      - name: Install tools (jq, openssl)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq openssl
 
       - name: Restore KUBECONFIG
         shell: bash
@@ -60,7 +74,6 @@ jobs:
             exit 1
           fi
           chmod 600 "$HOME/.kube/config"
-
           kubectl config use-context "$KUBE_CONTEXT" || true
           echo "== kubectl client version =="; kubectl version --client=true || true
           echo "== cluster info =="; kubectl cluster-info || true
@@ -76,35 +89,58 @@ jobs:
         run: |
           kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
-      # --- Fail-open webhook Rancher bila sudah ada (hindari macet pas upgrade) ---
+      # -------------------- GUARDRAILS AWAL --------------------
       - name: Fail-open Rancher webhooks (temporary)
         shell: bash
         run: |
           set -euo pipefail
           for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
             if kubectl get $kind rancher.cattle.io >/dev/null 2>&1; then
-              for i in $(seq 0 99); do
+              count=$(kubectl get $kind rancher.cattle.io -o json | jq '.webhooks | length' || echo 0)
+              for i in $(seq 0 $((count-1))); do
                 kubectl patch $kind rancher.cattle.io --type='json' \
-                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
-                  >/dev/null 2>&1 || true
+                  -p="[ \
+                    {\"op\":\"replace\",\"path\":\"/webhooks/$i/failurePolicy\",\"value\":\"Ignore\"}, \
+                    {\"op\":\"add\",\"path\":\"/webhooks/$i/timeoutSeconds\",\"value\":5} \
+                  ]" >/dev/null 2>&1 || true
               done
             fi
           done
 
-      # --- Generate self-signed TLS (untuk backend Ingress) ---
-      - name: Create/Refresh self-signed TLS secret for Rancher Ingress
+      - name: Fail-open ingress-nginx admission (temporary)
         shell: bash
         run: |
           set -euo pipefail
-          # generate 825 hari self-signed
+          for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            if kubectl get $kind ingress-nginx-admission >/dev/null 2>&1; then
+              count=$(kubectl get $kind ingress-nginx-admission -o json | jq '.webhooks | length' || echo 0)
+              for i in $(seq 0 $((count-1))); do
+                kubectl patch $kind ingress-nginx-admission --type='json' \
+                  -p="[ \
+                    {\"op\":\"replace\",\"path\":\"/webhooks/$i/failurePolicy\",\"value\":\"Ignore\"}, \
+                    {\"op\":\"add\",\"path\":\"/webhooks/$i/timeoutSeconds\",\"value\":5} \
+                  ]" >/dev/null 2>&1 || true
+              done
+            fi
+          done
+          # Tunggu controller ready supaya admission & ingress stabil
+          kubectl -n "$INGRESS_NS" wait --for=condition=ready pod -l app.kubernetes.io/component=controller --timeout=10m || true
+          # Tinjau endpoints admission (kadang baru kebentuk setelah controller ready)
+          kubectl -n "$INGRESS_NS" get endpoints ingress-nginx-controller-admission || true
+
+      # -------------------- TLS BACKEND (SELF-SIGNED) --------------------
+      - name: Create/Refresh self-signed TLS secret (backend Ingress)
+        shell: bash
+        run: |
+          set -euo pipefail
           openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
             -subj "/CN=${RANCHER_HOSTNAME}" \
             -keyout /tmp/tls.key -out /tmp/tls.crt
-
           kubectl -n cattle-system delete secret rancher-tls >/dev/null 2>&1 || true
           kubectl -n cattle-system create secret tls rancher-tls \
             --key /tmp/tls.key --cert /tmp/tls.crt
 
+      # -------------------- INSTALL / UPGRADE RANCHER --------------------
       - name: Install/Upgrade Rancher (ingress.tls.source=secret)
         env:
           BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
@@ -124,12 +160,10 @@ jobs:
             --set ingress.ingressClassName="${INGRESS_CLASS}" \
             --set ingress.tls.source="secret" \
             --set ingress.tls.secretName="rancher-tls" \
-            # Nginx Ingress tuning (connection longevity & uploads)
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-read-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-send-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="200m" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/websocket-services"="rancher" \
-            # Rancher baca real client IP dari header rantai proxy (CF -> NPM)
             --set-string extraEnv[0].name="CATTLE_PROXY_REAL_IP_HEADER" \
             --set-string extraEnv[0].value="X-Forwarded-For" \
             ${BOOTSTRAP_PASSWORD:+--set bootstrapPassword="${BOOTSTRAP_PASSWORD}"} \
@@ -137,30 +171,52 @@ jobs:
 
           echo "Waiting Rancher deployment..."
           kubectl -n cattle-system rollout status deploy/rancher --timeout=20m || (kubectl -n cattle-system get pods -o wide; false)
-
-          # Rancher webhook (kalau ada)
           kubectl -n cattle-system wait deploy/rancher-webhook --for=condition=Available --timeout=10m || true
 
-      # --- Balikkan webhook Rancher ke policy Fail ---
-      - name: Restore Rancher webhooks to Fail
+      # -------------------- RESTORE WEBHOOKS --------------------
+      - name: Restore Rancher webhooks (Fail)
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
           for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
             if kubectl get $kind rancher.cattle.io >/dev/null 2>&1; then
-              for i in $(seq 0 99); do
+              count=$(kubectl get $kind rancher.cattle.io -o json | jq '.webhooks | length' || echo 0)
+              for i in $(seq 0 $((count-1))); do
                 kubectl patch $kind rancher.cattle.io --type='json' \
-                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
-                  >/dev/null 2>&1 || true
+                  -p="[ \
+                    {\"op\":\"replace\",\"path\":\"/webhooks/$i/failurePolicy\",\"value\":\"Fail\"}, \
+                    {\"op\":\"add\",\"path\":\"/webhooks/$i/timeoutSeconds\",\"value\":10} \
+                  ]" >/dev/null 2>&1 || true
               done
             fi
           done
 
-      - name: Show ingress/service for NPM target
+      - name: Restore ingress-nginx admission (Fail)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            if kubectl get $kind ingress-nginx-admission >/dev/null 2>&1; then
+              count=$(kubectl get $kind ingress-nginx-admission -o json | jq '.webhooks | length' || echo 0)
+              for i in $(seq 0 $((count-1))); do
+                kubectl patch $kind ingress-nginx-admission --type='json' \
+                  -p="[ \
+                    {\"op\":\"replace\",\"path\":\"/webhooks/$i/failurePolicy\",\"value\":\"Fail\"}, \
+                    {\"op\":\"add\",\"path\":\"/webhooks/$i/timeoutSeconds\",\"value\":10} \
+                  ]" >/dev/null 2>&1 || true
+              done
+            fi
+          done
+
+      # -------------------- OUTPUT RANGKUMAN --------------------
+      - name: Show ingress & services (buat NPM target)
         if: ${{ always() }}
         run: |
-          echo "== ingress (all namespaces) =="
+          echo "== Ingresses =="
           kubectl get ingress -A
-          echo "== svc ingress controller (cari LoadBalancer IP MetalLB) =="
-          kubectl -n ingress-nginx get svc -o wide || true
+          echo "== Ingress Controller Service (cari LB/MetalLB IP) =="
+          kubectl -n "$INGRESS_NS" get svc -o wide || true
+          echo "== Rancher svc/ingress detail =="
+          kubectl -n cattle-system get svc,ingress -o wide || true
