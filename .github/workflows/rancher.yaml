@@ -1,4 +1,4 @@
-name: Deploy Rancher
+name: Deploy Rancher (TLS via NPM)
 
 on:
   workflow_dispatch:
@@ -8,29 +8,13 @@ on:
         required: true
         default: "k8s.madiunkab.go.id"
       ingress_class:
-        description: "Ingress class (nginx/traefik/haproxy, dll.)"
+        description: "Ingress class di cluster (nginx/traefik/haproxy, dll.)"
         required: true
         default: "nginx"
       rancher_version:
         description: "Chart version (atau 'latest')"
         required: true
         default: "latest"
-      deploy_cert_manager:
-        description: "Install/upgrade cert-manager?"
-        type: choice
-        options: ["true", "false"]
-        required: true
-        default: "true"
-      acme_email:
-        description: "Email Let's Encrypt (wajib kalau pakai cert-manager)"
-        required: false
-        default: "wicak@wicak.id"
-      challenge_type:
-        description: "LE challenge: http01 atau dns01-cloudflare"
-        type: choice
-        options: ["http01", "dns01-cloudflare"]
-        required: true
-        default: "http01"
       kube_context:
         description: "Nama context di kubeconfig"
         required: true
@@ -38,15 +22,13 @@ on:
 
 jobs:
   deploy-rancher:
-    # Ganti ke self-hosted kalau kamu pakai runner sendiri:
+    # pakai self-hosted runner? ganti ke self-hosted
     runs-on: ubuntu-latest
     env:
       KUBE_CONTEXT: ${{ inputs.kube_context }}
       RANCHER_HOSTNAME: ${{ inputs.rancher_hostname }}
       INGRESS_CLASS: ${{ inputs.ingress_class }}
       RANCHER_VERSION: ${{ inputs.rancher_version }}
-      ACME_EMAIL: ${{ inputs.acme_email }}
-      CHALLENGE_TYPE: ${{ inputs.challenge_type }}
 
     steps:
       - name: Checkout
@@ -83,7 +65,6 @@ jobs:
           kubectl config use-context "$KUBE_CONTEXT" || true
 
           echo "== kubectl client version =="
-          # Kompatibel semua versi kubectl
           kubectl version --client=true -o yaml || kubectl version --client=true || kubectl version
 
           echo "== cluster info =="
@@ -95,123 +76,38 @@ jobs:
           echo "== nodes =="
           kubectl get nodes -o wide
 
-      - name: Add Helm repos
+      - name: Add Helm repo (Rancher)
         run: |
           helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
-          helm repo add jetstack https://charts.jetstack.io
           helm repo update
 
-      - name: Install/upgrade cert-manager (CRDs ON)
-        if: ${{ inputs.deploy_cert_manager == 'true' }}
-        run: |
-          kubectl get ns cert-manager >/dev/null 2>&1 || kubectl create ns cert-manager
-          helm upgrade --install cert-manager jetstack/cert-manager \
-            --namespace cert-manager \
-            --set crds.enabled=true
-          kubectl -n cert-manager rollout status deploy/cert-manager --timeout=5m
-          kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=5m
-          kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=5m
-
-      - name: (dns01) Create Cloudflare API token Secret
-        if: ${{ inputs.deploy_cert_manager == 'true' && inputs.challenge_type == 'dns01-cloudflare' }}
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        run: |
-          if [[ -z "${CF_API_TOKEN:-}" ]]; then
-            echo "ERROR: Set secret CF_API_TOKEN untuk dns01-cloudflare." >&2
-            exit 1
-          fi
-          kubectl -n cert-manager create secret generic cloudflare-api-token-secret \
-            --from-literal=api-token="${CF_API_TOKEN}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Create/Apply ClusterIssuer (Let's Encrypt)
-        if: ${{ inputs.deploy_cert_manager == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${CHALLENGE_TYPE}" == "http01" ]]; then
-            cat <<YAML | kubectl apply -f -
-            apiVersion: cert-manager.io/v1
-            kind: ClusterIssuer
-            metadata:
-              name: letsencrypt-prod
-            spec:
-              acme:
-                email: "${ACME_EMAIL}"
-                server: https://acme-v02.api.letsencrypt.org/directory
-                privateKeySecretRef:
-                  name: le-key
-                solvers:
-                  - http01:
-                      ingress:
-                        class: "${INGRESS_CLASS}"
-            YAML
-          else
-            cat <<YAML | kubectl apply -f -
-            apiVersion: cert-manager.io/v1
-            kind: ClusterIssuer
-            metadata:
-              name: letsencrypt-prod
-            spec:
-              acme:
-                email: "${ACME_EMAIL}"
-                server: https://acme-v02.api.letsencrypt.org/directory
-                privateKeySecretRef:
-                  name: le-key
-                solvers:
-                  - dns01:
-                      cloudflare:
-                        apiTokenSecretRef:
-                          name: cloudflare-api-token-secret
-                          key: api-token
-            YAML
-          fi
-          kubectl get clusterissuer letsencrypt-prod -o yaml
-
-      - name: Create namespace cattle-system
+      - name: Ensure namespace cattle-system
         run: |
           kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
-      - name: Install/Upgrade Rancher
+      - name: Install/Upgrade Rancher (TLS terminated at NPM)
         env:
           BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
         run: |
           set -euo pipefail
-          HELM_ARGS=(
-            rancher-latest/rancher
-            --namespace cattle-system
-            --set hostname="${RANCHER_HOSTNAME}"
-            --set ingress.tls.source=letsEncrypt
-            --set letsEncrypt.email="${ACME_EMAIL}"
-            --set letsEncrypt.ingress.class="${INGRESS_CLASS}"
-          )
-          # Kalau pakai DNS-01 Cloudflare, arahkan ke ClusterIssuer yang kita buat sendiri
-          if [[ "${CHALLENGE_TYPE}" == "dns01-cloudflare" ]]; then
-            HELM_ARGS+=( --set-string privateCA=false )
-            HELM_ARGS+=( --set-string additionalTrustedCAs=false )
-            # rancher chart otomatis pakai cert-manager; untuk dns01, biarkan issuer di Ingress via annotation:
-            HELM_ARGS+=( --set-string ingress.extraAnnotations."cert-manager\.io/cluster-issuer"="letsencrypt-prod" )
-          else
-            # http01: pakai integrasi default helm values
-            true
-          fi
-          # password bootstrap hanya dipakai saat first install
-          if [[ -n "${BOOTSTRAP_PASSWORD:-}" ]]; then
-            HELM_ARGS+=( --set bootstrapPassword="${BOOTSTRAP_PASSWORD}" )
-          fi
 
-          if [[ "${RANCHER_VERSION}" != "latest" ]]; then
-            HELM_ARGS+=( --version "${RANCHER_VERSION}" )
-          fi
+          # TLS off di cluster: biar HTTP-only, NPM yang terminate HTTPS
+          # Tambah beberapa annotation yang umum dipakai (opsional)
+          helm upgrade --install rancher rancher-latest/rancher \
+            --namespace cattle-system \
+            --set hostname="${RANCHER_HOSTNAME}" \
+            --set ingress.tls.source=none \
+            --set ingress.ingressClassName="${INGRESS_CLASS}" \
+            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-read-timeout"="3600" \
+            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-send-timeout"="3600" \
+            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="20m" \
+            ${BOOTSTRAP_PASSWORD:+--set bootstrapPassword="${BOOTSTRAP_PASSWORD}"} \
+            $([ "${RANCHER_VERSION}" != "latest" ] && echo --version "${RANCHER_VERSION}")
 
-          helm upgrade --install rancher "${HELM_ARGS[@]}"
-
-      - name: Wait Rancher rollout
-        run: |
+          echo "Waiting Rancher deployment..."
           kubectl -n cattle-system rollout status deploy/rancher --timeout=15m
-          kubectl -n cattle-system get deploy,svc,ingress
 
-      - name: Show Rancher URL
+      - name: Show Rancher objects
         run: |
-          echo "Rancher URL: https://${RANCHER_HOSTNAME}"
+          kubectl -n cattle-system get deploy,svc,ingress -o wide
+          echo "Rancher URL (via NPM): https://${RANCHER_HOSTNAME}"
