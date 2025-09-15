@@ -79,8 +79,20 @@ jobs:
             exit 1
           fi
           chmod 600 $HOME/.kube/config
+
           kubectl config use-context "$KUBE_CONTEXT" || true
-          kubectl version --short
+
+          echo "== kubectl client version =="
+          # Kompatibel semua versi kubectl
+          kubectl version --client=true -o yaml || kubectl version --client=true || kubectl version
+
+          echo "== cluster info =="
+          kubectl cluster-info || true
+
+          echo "== apiserver readiness (best-effort) =="
+          kubectl get --raw=/readyz?verbose || true
+
+          echo "== nodes =="
           kubectl get nodes -o wide
 
       - name: Add Helm repos
