@@ -24,22 +24,8 @@ on:
         description: "Nama L2Advertisement"
         required: true
         default: "l2adv-local"
-      patch_ingress:
-        description: "Patch service Ingress jadi LoadBalancer?"
-        type: choice
-        options: ["true", "false"]
-        required: true
-        default: "true"
-      ingress_namespace:
-        description: "Namespace Ingress Controller service"
-        required: true
-        default: "ingress-nginx"
-      ingress_service:
-        description: "Nama service Ingress Controller"
-        required: true
-        default: "ingress-nginx-controller"
       loadbalancer_ip:
-        description: "IP MetalLB untuk Ingress (opsi patch)"
+        description: "IP MetalLB untuk Ingress"
         required: true
         default: "10.10.2.20"
 
@@ -52,9 +38,6 @@ jobs:
       POOL_ADDRESSES: ${{ inputs.pool_addresses }}
       POOL_NAME: ${{ inputs.pool_name }}
       ADV_NAME: ${{ inputs.adv_name }}
-      PATCH_INGRESS: ${{ inputs.patch_ingress }}
-      INGRESS_NS: ${{ inputs.ingress_namespace }}
-      INGRESS_SVC: ${{ inputs.ingress_service }}
       LB_IP: ${{ inputs.loadbalancer_ip }}
 
     steps:
@@ -92,12 +75,13 @@ jobs:
           kubectl cluster-info || true
           kubectl get nodes -o wide
 
-      - name: Add Helm repo (MetalLB)
+      - name: Add Helm repos
         run: |
           helm repo add metallb https://metallb.github.io/metallb
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
           helm repo update
 
-      # ---- Rancher webhook -> fail-open sementara (biar create ns lancar) ----
+      # ---- Rancher webhook -> fail-open sementara ----
       - name: (Rancher) Temporarily fail-open validating webhook
         shell: bash
         run: |
@@ -122,28 +106,23 @@ jobs:
           helm upgrade --install metallb "${HELM_ARGS[@]}" --wait --timeout 10m
           kubectl -n metallb-system get deploy,ds,pods -o wide
 
-      # ---- Tunggu CRD Established + webhook endpoints siap ----
       - name: Wait MetalLB webhook to be ready
         shell: bash
         run: |
           set -euo pipefail
-          echo "Waiting for MetalLB CRDs to be established..."
+          echo "Waiting CRDs..."
           for crd in ipaddresspools.metallb.io l2advertisements.metallb.io; do
             kubectl wait --for=condition=Established crd/$crd --timeout=180s
           done
-
-          echo "Waiting metallb-controller Available..."
+          echo "Waiting controller Available..."
           kubectl -n metallb-system wait deploy/metallb-controller --for=condition=Available --timeout=300s
-
-          echo "Waiting metallb-webhook-service endpoints..."
+          echo "Waiting webhook endpoints..."
           for i in {1..60}; do
             EP=$(kubectl -n metallb-system get endpoints metallb-webhook-service -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
             [[ -n "${EP}" ]] && { echo "Webhook endpoint: ${EP}"; break; }
-            kubectl -n metallb-system get endpoints metallb-webhook-service || true
             sleep 5
           done
 
-      # ---- Fallback: fail-open MetalLB webhook kalau masih balap ----
       - name: (Fallback) Temporarily fail-open MetalLB validating webhook
         shell: bash
         run: |
@@ -162,7 +141,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gettext-base
 
-      - name: Apply IPAddressPool + L2Advertisement (with retry)
+      - name: Apply IPAddressPool + L2Advertisement (retry)
         shell: bash
         run: |
           set -euo pipefail
@@ -170,39 +149,65 @@ jobs:
           envsubst < k8s/metallb/ip-pool.yaml.tpl > /tmp/ip-pool.yaml
           echo "--- Applying:"
           cat /tmp/ip-pool.yaml
-
-          # kadang admission masih race; coba retry beberapa kali
           n=0
           until kubectl apply -f /tmp/ip-pool.yaml; do
             n=$((n+1))
             [[ $n -ge 5 ]] && { echo "Apply CR gagal setelah retry"; exit 1; }
-            echo "Retry apply CR ($n/5)..."
-            sleep 5
+            echo "Retry apply CR ($n/5)..."; sleep 5
           done
-
-          echo "== Objects =="
           kubectl -n metallb-system get ipaddresspool,l2advertisement -o yaml
 
-      - name: (Optional) Patch Ingress service to LoadBalancer
-        if: ${{ inputs.patch_ingress == 'true' }}
+      # ====== AUTODETECT / INSTALL INGRESS CONTROLLER ======
+      - name: Detect or install Ingress Controller
+        id: detect
         shell: bash
         run: |
           set -euo pipefail
-          echo "Patching ${INGRESS_NS}/${INGRESS_SVC} to LoadBalancer with IP ${LB_IP}"
-          kubectl -n "${INGRESS_NS}" patch svc "${INGRESS_SVC}" \
-            --type merge \
-            -p "{\"spec\": {\"type\": \"LoadBalancer\", \"externalTrafficPolicy\": \"Local\", \"loadBalancerIP\": \"${LB_IP}\"}}"
+          FOUND_NS=""
+          FOUND_SVC=""
+          if kubectl -n kube-system get svc traefik >/dev/null 2>&1; then
+            FOUND_NS="kube-system"; FOUND_SVC="traefik"
+          elif kubectl -n ingress-nginx get svc ingress-nginx-controller >/dev/null 2>&1; then
+            FOUND_NS="ingress-nginx"; FOUND_SVC="ingress-nginx-controller"
+          elif kubectl -n nginx-ingress get svc nginx-ingress-controller >/dev/null 2>&1; then
+            FOUND_NS="nginx-ingress"; FOUND_SVC="nginx-ingress-controller"
+          fi
+
+          if [[ -z "$FOUND_NS" ]]; then
+            echo "No ingress controller found. Installing ingress-nginx..."
+            helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+              -n ingress-nginx --create-namespace \
+              --set controller.service.type=LoadBalancer \
+              --set controller.service.externalTrafficPolicy=Local \
+              --set controller.service.loadBalancerIP="${LB_IP}" \
+              --wait --timeout 10m
+            FOUND_NS="ingress-nginx"; FOUND_SVC="ingress-nginx-controller"
+          fi
+
+          echo "ns=$FOUND_NS"  >> "$GITHUB_OUTPUT"
+          echo "svc=$FOUND_SVC" >> "$GITHUB_OUTPUT"
+          echo "Detected ingress service: $FOUND_NS/$FOUND_SVC"
+
+      - name: Patch Ingress service to LoadBalancer (idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          NS="${{ steps.detect.outputs.ns }}"
+          SVC="${{ steps.detect.outputs.svc }}"
+          echo "Patching $NS/$SVC to LoadBalancer with IP ${LB_IP}"
+          kubectl -n "$NS" patch svc "$SVC" --type merge \
+            -p "{\"spec\": {\"type\": \"LoadBalancer\", \"externalTrafficPolicy\": \"Local\", \"loadBalancerIP\": \"${LB_IP}\"}}" || true
 
           echo "Wait EXTERNAL-IP..."
           for i in {1..60}; do
-            kubectl -n "${INGRESS_NS}" get svc "${INGRESS_SVC}" -o wide
-            EXIP=$(kubectl -n "${INGRESS_NS}" get svc "${INGRESS_SVC}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            kubectl -n "$NS" get svc "$SVC" -o wide
+            EXIP=$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
             [[ -n "${EXIP}" ]] && break
             sleep 5
           done
           echo "EXTERNAL-IP: ${EXIP:-<none>}"
 
-      # ---- Restore webhooks ke Fail lagi ----
+      # ---- Restore webhooks ----
       - name: Restore MetalLB webhook failurePolicy=Fail
         if: ${{ always() }}
         shell: bash
@@ -222,7 +227,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if kubectl get validatingwebhookconfiguration rancher.cattle.io >/div/null 2>&1; then
+          if kubectl get validatingwebhookconfiguration rancher.cattle.io >/dev/null 2>&1; then
             for i in $(seq 0 19); do
               kubectl patch validatingwebhookconfiguration rancher.cattle.io \
                 --type='json' \
@@ -235,5 +240,5 @@ jobs:
         run: |
           echo "Pool   : ${POOL_ADDRESSES} (name=${POOL_NAME})"
           echo "Adv    : ${ADV_NAME}"
-          echo "Ingress: ${INGRESS_NS}/${INGRESS_SVC}"
-          kubectl -n "${INGRESS_NS}" get svc "${INGRESS_SVC}" -o wide || true
+          echo "Ingress: ${{ steps.detect.outputs.ns }}/${{ steps.detect.outputs.svc }}"
+          kubectl -n "${{ steps.detect.outputs.ns }}" get svc "${{ steps.detect.outputs.svc }}" -o wide || true
