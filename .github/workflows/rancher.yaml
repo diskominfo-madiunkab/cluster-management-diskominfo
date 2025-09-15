@@ -22,7 +22,7 @@ on:
 
 jobs:
   deploy-rancher:
-    runs-on: ubuntu-latest # ganti ke self-hosted kalau perlu
+    runs-on: ubuntu-latest
     env:
       KUBE_CONTEXT: ${{ inputs.kube_context }}
       RANCHER_HOSTNAME: ${{ inputs.rancher_hostname }}
@@ -50,22 +50,22 @@ jobs:
           KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_CONTENT }}
         run: |
           set -euo pipefail
-          mkdir -p $HOME/.kube
+          mkdir -p "$HOME/.kube"
           if [[ -n "${KUBECONFIG_B64:-}" ]]; then
-            echo "$KUBECONFIG_B64" | base64 -d > $HOME/.kube/config
+            echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
           elif [[ -n "${KUBECONFIG_CONTENT:-}" ]]; then
-            echo "$KUBECONFIG_CONTENT" > $HOME/.kube/config
+            echo "$KUBECONFIG_CONTENT" > "$HOME/.kube/config"
           else
             echo "ERROR: Set secret KUBECONFIG_B64 atau KUBECONFIG_CONTENT" >&2
             exit 1
           fi
-          chmod 600 $HOME/.kube/config
+          chmod 600 "$HOME/.kube/config"
 
           kubectl config use-context "$KUBE_CONTEXT" || true
-          echo "== kubectl client version =="; kubectl version --client=true -o yaml || kubectl version --client=true || kubectl version
+          echo "== kubectl client version =="; kubectl version --client=true || true
           echo "== cluster info =="; kubectl cluster-info || true
           echo "== apiserver readiness =="; kubectl get --raw=/readyz?verbose || true
-          echo "== nodes =="; kubectl get nodes -o wide
+          echo "== nodes =="; kubectl get nodes -o wide || true
 
       - name: Add Helm repo (Rancher)
         run: |
@@ -76,15 +76,24 @@ jobs:
         run: |
           kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
-      - name: (Rancher) Fail-open admission webhooks (Validating & Mutating)
+      # --- Fail-open admission webhooks sementara (Rancher & cert-manager) ---
+      - name: Fail-open Rancher & cert-manager webhooks (temporary)
         shell: bash
         run: |
           set -euo pipefail
           for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            # Rancher
             if kubectl get $kind rancher.cattle.io >/dev/null 2>&1; then
-              for i in $(seq 0 49); do
-                kubectl patch $kind rancher.cattle.io \
-                  --type='json' \
+              for i in $(seq 0 99); do
+                kubectl patch $kind rancher.cattle.io --type='json' \
+                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
+                  >/dev/null 2>&1 || true
+              done
+            fi
+            # cert-manager
+            if kubectl get $kind cert-manager-webhook >/dev/null 2>&1; then
+              for i in $(seq 0 99); do
+                kubectl patch $kind cert-manager-webhook --type='json' \
                   -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
                   >/dev/null 2>&1 || true
               done
@@ -96,38 +105,53 @@ jobs:
           BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
         run: |
           set -euo pipefail
-          kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
-          helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
-          helm repo update
+          # Pilih versi chart
+          CHART="rancher-latest/rancher"
+          if [[ "${RANCHER_VERSION}" != "latest" ]]; then
+            VERSION_ARG="--version ${RANCHER_VERSION}"
+          else
+            VERSION_ARG=""
+          fi
 
-          helm upgrade --install rancher rancher-latest/rancher \
-            --namespace cattle-system \
+          # Install/upgrade Rancher
+          helm upgrade --install rancher "$CHART" \
+            --namespace cattle-system ${VERSION_ARG} \
             --set hostname="${RANCHER_HOSTNAME}" \
             --set ingress.ingressClassName="${INGRESS_CLASS}" \
-            --set ingress.tls.source=rancher \
+            --set ingress.tls.source="rancher" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-read-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-send-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="20m" \
+            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/websocket-services"="rancher" \
+            --set-string extraEnv[0].name="CATTLE_PROXY_REAL_IP_HEADER" \
+            --set-string extraEnv[0].value="X-Forwarded-For" \
             ${BOOTSTRAP_PASSWORD:+--set bootstrapPassword="${BOOTSTRAP_PASSWORD}"} \
-            --wait --timeout 20m
+            --wait --timeout 30m
 
           echo "Waiting Rancher deployment..."
-          kubectl -n cattle-system rollout status deploy/rancher --timeout=15m
+          kubectl -n cattle-system rollout status deploy/rancher --timeout=20m || (kubectl -n cattle-system get pods; false)
 
-          # Tunggu webhook Rancher Available (kalau sudah ada)
+          # Tunggu webhook Rancher bila ada
           kubectl -n cattle-system wait deploy/rancher-webhook --for=condition=Available --timeout=10m || true
 
-      - name: (Rancher) Restore admission webhooks to Fail
+      # --- Balikkan webhooks ke default (Fail) ---
+      - name: Restore webhooks to Fail
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
           for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
             if kubectl get $kind rancher.cattle.io >/dev/null 2>&1; then
-              for i in $(seq 0 49); do
-                kubectl patch $kind rancher.cattle.io \
-                  --type='json' \
+              for i in $(seq 0 99); do
+                kubectl patch $kind rancher.cattle.io --type='json' \
+                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
+                  >/dev/null 2>&1 || true
+              done
+            fi
+            if kubectl get $kind cert-manager-webhook >/dev/null 2>&1; then
+              for i in $(seq 0 99); do
+                kubectl patch $kind cert-manager-webhook --type='json' \
                   -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
                   >/dev/null 2>&1 || true
               done
