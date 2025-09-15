@@ -1,5 +1,0 @@
-replicas: 3
-ingress:
-  tls:
-    source: letsEncrypt
-# hostname/email/password di-inject dari workflow (vars & secrets)
