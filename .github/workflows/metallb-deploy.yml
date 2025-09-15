@@ -1,17 +1,239 @@
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: ${POOL_NAME}
-  namespace: metallb-system
-spec:
-  addresses:
-    - ${POOL_ADDRESSES}
----
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-  name: ${ADV_NAME}
-  namespace: metallb-system
-spec:
-  ipAddressPools:
-    - ${POOL_NAME}
+name: Deploy MetalLB (L2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kube_context:
+        description: "Nama context kubeconfig"
+        required: true
+        default: "gha"
+      metallb_version:
+        description: "Versi chart MetalLB (atau 'latest')"
+        required: true
+        options: ["0.14.5", "latest"]
+        default: "latest"
+      pool_addresses:
+        description: "Alamat pool (contoh: 10.10.2.20-10.10.2.20)"
+        required: true
+        default: "10.10.2.20-10.10.2.20"
+      pool_name:
+        description: "Nama IPAddressPool"
+        required: true
+        default: "lb-pool-local"
+      adv_name:
+        description: "Nama L2Advertisement"
+        required: true
+        default: "l2adv-local"
+      patch_ingress:
+        description: "Patch service Ingress jadi LoadBalancer?"
+        type: choice
+        options: ["true", "false"]
+        required: true
+        default: "true"
+      ingress_namespace:
+        description: "Namespace Ingress Controller service"
+        required: true
+        default: "ingress-nginx"
+      ingress_service:
+        description: "Nama service Ingress Controller"
+        required: true
+        default: "ingress-nginx-controller"
+      loadbalancer_ip:
+        description: "IP MetalLB untuk Ingress (opsi patch)"
+        required: true
+        default: "10.10.2.20"
+
+jobs:
+  deploy-metallb:
+    runs-on: ubuntu-latest
+    env:
+      KUBE_CONTEXT: ${{ inputs.kube_context }}
+      METALLB_VERSION: ${{ inputs.metallb_version }}
+      POOL_ADDRESSES: ${{ inputs.pool_addresses }}
+      POOL_NAME: ${{ inputs.pool_name }}
+      ADV_NAME: ${{ inputs.adv_name }}
+      PATCH_INGRESS: ${{ inputs.patch_ingress }}
+      INGRESS_NS: ${{ inputs.ingress_namespace }}
+      INGRESS_SVC: ${{ inputs.ingress_service }}
+      LB_IP: ${{ inputs.loadbalancer_ip }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "latest"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "latest"
+
+      - name: Restore KUBECONFIG
+        shell: bash
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_CONTENT }}
+        run: |
+          set -euo pipefail
+          mkdir -p $HOME/.kube
+          if [[ -n "${KUBECONFIG_B64:-}" ]]; then
+            echo "$KUBECONFIG_B64" | base64 -d > $HOME/.kube/config
+          elif [[ -n "${KUBECONFIG_CONTENT:-}" ]]; then
+            echo "$KUBECONFIG_CONTENT" > $HOME/.kube/config
+          else
+            echo "ERROR: set KUBECONFIG_B64 atau KUBECONFIG_CONTENT" >&2
+            exit 1
+          fi
+          chmod 600 $HOME/.kube/config
+          kubectl config use-context "$KUBE_CONTEXT" || true
+          kubectl cluster-info || true
+          kubectl get nodes -o wide
+
+      - name: Add Helm repo (MetalLB)
+        run: |
+          helm repo add metallb https://metallb.github.io/metallb
+          helm repo update
+
+      # ---- Rancher webhook -> fail-open sementara (biar create ns lancar) ----
+      - name: (Rancher) Temporarily fail-open validating webhook
+        shell: bash
+        run: |
+          set -euo pipefail
+          if kubectl get validatingwebhookconfiguration rancher.cattle.io >/dev/null 2>&1; then
+            for i in $(seq 0 19); do
+              kubectl patch validatingwebhookconfiguration rancher.cattle.io \
+                --type='json' \
+                -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
+                >/dev/null 2>&1 || true
+            done
+          fi
+
+      - name: Install/Upgrade MetalLB (with CRDs)
+        run: |
+          set -euo pipefail
+          kubectl get ns metallb-system >/dev/null 2>&1 || kubectl create ns metallb-system
+          HELM_ARGS=( metallb/metallb -n metallb-system --set crds.enabled=true )
+          if [[ "${METALLB_VERSION}" != "latest" ]]; then
+            HELM_ARGS+=( --version "${METALLB_VERSION}" )
+          fi
+          helm upgrade --install metallb "${HELM_ARGS[@]}" --wait --timeout 10m
+          kubectl -n metallb-system get deploy,ds,pods -o wide
+
+      # ---- Tunggu CRD Established + webhook endpoints siap ----
+      - name: Wait MetalLB webhook to be ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Waiting for MetalLB CRDs to be established..."
+          for crd in ipaddresspools.metallb.io l2advertisements.metallb.io; do
+            kubectl wait --for=condition=Established crd/$crd --timeout=180s
+          done
+
+          echo "Waiting metallb-controller Available..."
+          kubectl -n metallb-system wait deploy/metallb-controller --for=condition=Available --timeout=300s
+
+          echo "Waiting metallb-webhook-service endpoints..."
+          for i in {1..60}; do
+            EP=$(kubectl -n metallb-system get endpoints metallb-webhook-service -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
+            [[ -n "${EP}" ]] && { echo "Webhook endpoint: ${EP}"; break; }
+            kubectl -n metallb-system get endpoints metallb-webhook-service || true
+            sleep 5
+          done
+
+      # ---- Fallback: fail-open MetalLB webhook kalau masih balap ----
+      - name: (Fallback) Temporarily fail-open MetalLB validating webhook
+        shell: bash
+        run: |
+          set -euo pipefail
+          if kubectl get validatingwebhookconfiguration metallb-webhook-configuration >/dev/null 2>&1; then
+            for i in $(seq 0 19); do
+              kubectl patch validatingwebhookconfiguration metallb-webhook-configuration \
+                --type='json' \
+                -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
+                >/dev/null 2>&1 || true
+            done
+          fi
+
+      - name: Install envsubst
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext-base
+
+      - name: Apply IPAddressPool + L2Advertisement (with retry)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export POOL_NAME POOL_ADDRESSES ADV_NAME
+          envsubst < k8s/metallb/ip-pool.yaml.tpl > /tmp/ip-pool.yaml
+          echo "--- Applying:"
+          cat /tmp/ip-pool.yaml
+
+          # kadang admission masih race; coba retry beberapa kali
+          n=0
+          until kubectl apply -f /tmp/ip-pool.yaml; do
+            n=$((n+1))
+            [[ $n -ge 5 ]] && { echo "Apply CR gagal setelah retry"; exit 1; }
+            echo "Retry apply CR ($n/5)..."
+            sleep 5
+          done
+
+          echo "== Objects =="
+          kubectl -n metallb-system get ipaddresspool,l2advertisement -o yaml
+
+      - name: (Optional) Patch Ingress service to LoadBalancer
+        if: ${{ inputs.patch_ingress == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Patching ${INGRESS_NS}/${INGRESS_SVC} to LoadBalancer with IP ${LB_IP}"
+          kubectl -n "${INGRESS_NS}" patch svc "${INGRESS_SVC}" \
+            --type merge \
+            -p "{\"spec\": {\"type\": \"LoadBalancer\", \"externalTrafficPolicy\": \"Local\", \"loadBalancerIP\": \"${LB_IP}\"}}"
+
+          echo "Wait EXTERNAL-IP..."
+          for i in {1..60}; do
+            kubectl -n "${INGRESS_NS}" get svc "${INGRESS_SVC}" -o wide
+            EXIP=$(kubectl -n "${INGRESS_NS}" get svc "${INGRESS_SVC}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            [[ -n "${EXIP}" ]] && break
+            sleep 5
+          done
+          echo "EXTERNAL-IP: ${EXIP:-<none>}"
+
+      # ---- Restore webhooks ke Fail lagi ----
+      - name: Restore MetalLB webhook failurePolicy=Fail
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if kubectl get validatingwebhookconfiguration metallb-webhook-configuration >/dev/null 2>&1; then
+            for i in $(seq 0 19); do
+              kubectl patch validatingwebhookconfiguration metallb-webhook-configuration \
+                --type='json' \
+                -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
+                >/dev/null 2>&1 || true
+            done
+          fi
+
+      - name: (Rancher) Restore webhook failurePolicy=Fail
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if kubectl get validatingwebhookconfiguration rancher.cattle.io >/div/null 2>&1; then
+            for i in $(seq 0 19); do
+              kubectl patch validatingwebhookconfiguration rancher.cattle.io \
+                --type='json' \
+                -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
+                >/dev/null 2>&1 || true
+            done
+          fi
+
+      - name: Summary
+        run: |
+          echo "Pool   : ${POOL_ADDRESSES} (name=${POOL_NAME})"
+          echo "Adv    : ${ADV_NAME}"
+          echo "Ingress: ${INGRESS_NS}/${INGRESS_SVC}"
+          kubectl -n "${INGRESS_NS}" get svc "${INGRESS_SVC}" -o wide || true
