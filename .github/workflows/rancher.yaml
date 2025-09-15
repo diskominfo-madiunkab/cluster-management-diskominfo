@@ -76,27 +76,60 @@ jobs:
         run: |
           kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
+      - name: (Rancher) Fail-open admission webhooks (Validating & Mutating)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            if kubectl get $kind rancher.cattle.io >/dev/null 2>&1; then
+              for i in $(seq 0 49); do
+                kubectl patch $kind rancher.cattle.io \
+                  --type='json' \
+                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
+                  >/dev/null 2>&1 || true
+              done
+            fi
+          done
+
       - name: Install/Upgrade Rancher (TLS self-signed at Ingress)
         env:
           BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
         run: |
           set -euo pipefail
-          # TLS internal aktif di Ingress (self-signed)
+          kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
+
+          helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
+          helm repo update
+
           helm upgrade --install rancher rancher-latest/rancher \
             --namespace cattle-system \
             --set hostname="${RANCHER_HOSTNAME}" \
             --set ingress.ingressClassName="${INGRESS_CLASS}" \
             --set ingress.tls.source=rancher \
-            --set-string ingress.extraAnnotations."nginx\.insress\.kubernetes\.io/proxy-read-timeout"="3600" \
+            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-read-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-send-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="20m" \
             ${BOOTSTRAP_PASSWORD:+--set bootstrapPassword="${BOOTSTRAP_PASSWORD}"} \
-            $([ "${RANCHER_VERSION}" != "latest" ] && echo --version "${RANCHER_VERSION}")
+            --wait --timeout 20m
 
           echo "Waiting Rancher deployment..."
           kubectl -n cattle-system rollout status deploy/rancher --timeout=15m
 
-      - name: Show Rancher objects
+          # Tunggu webhook Rancher Available (kalau sudah ada)
+          kubectl -n cattle-system wait deploy/rancher-webhook --for=condition=Available --timeout=10m || true
+
+      - name: (Rancher) Restore admission webhooks to Fail
+        if: ${{ always() }}
+        shell: bash
         run: |
-          kubectl -n cattle-system get deploy,svc,ingress -o wide
-          echo "Rancher URL (via NPM -> upstream HTTPS): https://${RANCHER_HOSTNAME}"
+          set -euo pipefail
+          for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            if kubectl get $kind rancher.cattle.io >/dev/null 2>&1; then
+              for i in $(seq 0 49); do
+                kubectl patch $kind rancher.cattle.io \
+                  --type='json' \
+                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
+                  >/dev/null 2>&1 || true
+              done
+            fi
+          done
