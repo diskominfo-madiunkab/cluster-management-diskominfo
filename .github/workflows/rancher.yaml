@@ -1,4 +1,4 @@
-name: Deploy Rancher (TLS internal / self-signed)
+name: Deploy Rancher (Cloudflare + NPM, TLS internal/self-signed)
 
 on:
   workflow_dispatch:
@@ -72,17 +72,16 @@ jobs:
           helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
           helm repo update
 
-      - name: Ensure namespace cattle-system
+      - name: Ensure namespaces
         run: |
           kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
-      # --- Fail-open admission webhooks sementara (Rancher & cert-manager) ---
-      - name: Fail-open Rancher & cert-manager webhooks (temporary)
+      # --- Fail-open webhook Rancher bila sudah ada (hindari macet pas upgrade) ---
+      - name: Fail-open Rancher webhooks (temporary)
         shell: bash
         run: |
           set -euo pipefail
           for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
-            # Rancher
             if kubectl get $kind rancher.cattle.io >/dev/null 2>&1; then
               for i in $(seq 0 99); do
                 kubectl patch $kind rancher.cattle.io --type='json' \
@@ -90,23 +89,28 @@ jobs:
                   >/dev/null 2>&1 || true
               done
             fi
-            # cert-manager
-            if kubectl get $kind cert-manager-webhook >/dev/null 2>&1; then
-              for i in $(seq 0 99); do
-                kubectl patch $kind cert-manager-webhook --type='json' \
-                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Ignore'}]" \
-                  >/dev/null 2>&1 || true
-              done
-            fi
           done
 
-      - name: Install/Upgrade Rancher (TLS self-signed at Ingress)
-        env:
-          BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
+      # --- Generate self-signed TLS (untuk backend Ingress) ---
+      - name: Create/Refresh self-signed TLS secret for Rancher Ingress
+        shell: bash
         run: |
           set -euo pipefail
+          # generate 825 hari self-signed
+          openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+            -subj "/CN=${RANCHER_HOSTNAME}" \
+            -keyout /tmp/tls.key -out /tmp/tls.crt
 
-          # Pilih versi chart
+          kubectl -n cattle-system delete secret rancher-tls >/dev/null 2>&1 || true
+          kubectl -n cattle-system create secret tls rancher-tls \
+            --key /tmp/tls.key --cert /tmp/tls.crt
+
+      - name: Install/Upgrade Rancher (ingress.tls.source=secret)
+        env:
+          BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
           CHART="rancher-latest/rancher"
           if [[ "${RANCHER_VERSION}" != "latest" ]]; then
             VERSION_ARG="--version ${RANCHER_VERSION}"
@@ -114,29 +118,31 @@ jobs:
             VERSION_ARG=""
           fi
 
-          # Install/upgrade Rancher
           helm upgrade --install rancher "$CHART" \
             --namespace cattle-system ${VERSION_ARG} \
             --set hostname="${RANCHER_HOSTNAME}" \
             --set ingress.ingressClassName="${INGRESS_CLASS}" \
-            --set ingress.tls.source="rancher" \
+            --set ingress.tls.source="secret" \
+            --set ingress.tls.secretName="rancher-tls" \
+            # Nginx Ingress tuning (connection longevity & uploads)
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-read-timeout"="3600" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-send-timeout"="3600" \
-            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="20m" \
+            --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="200m" \
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/websocket-services"="rancher" \
+            # Rancher baca real client IP dari header rantai proxy (CF -> NPM)
             --set-string extraEnv[0].name="CATTLE_PROXY_REAL_IP_HEADER" \
             --set-string extraEnv[0].value="X-Forwarded-For" \
             ${BOOTSTRAP_PASSWORD:+--set bootstrapPassword="${BOOTSTRAP_PASSWORD}"} \
             --wait --timeout 30m
 
           echo "Waiting Rancher deployment..."
-          kubectl -n cattle-system rollout status deploy/rancher --timeout=20m || (kubectl -n cattle-system get pods; false)
+          kubectl -n cattle-system rollout status deploy/rancher --timeout=20m || (kubectl -n cattle-system get pods -o wide; false)
 
-          # Tunggu webhook Rancher bila ada
+          # Rancher webhook (kalau ada)
           kubectl -n cattle-system wait deploy/rancher-webhook --for=condition=Available --timeout=10m || true
 
-      # --- Balikkan webhooks ke default (Fail) ---
-      - name: Restore webhooks to Fail
+      # --- Balikkan webhook Rancher ke policy Fail ---
+      - name: Restore Rancher webhooks to Fail
         if: ${{ always() }}
         shell: bash
         run: |
@@ -149,11 +155,12 @@ jobs:
                   >/dev/null 2>&1 || true
               done
             fi
-            if kubectl get $kind cert-manager-webhook >/dev/null 2>&1; then
-              for i in $(seq 0 99); do
-                kubectl patch $kind cert-manager-webhook --type='json' \
-                  -p="[{'op':'replace','path':'/webhooks/$i/failurePolicy','value':'Fail'}]" \
-                  >/dev/null 2>&1 || true
-              done
-            fi
           done
+
+      - name: Show ingress/service for NPM target
+        if: ${{ always() }}
+        run: |
+          echo "== ingress (all namespaces) =="
+          kubectl get ingress -A
+          echo "== svc ingress controller (cari LoadBalancer IP MetalLB) =="
+          kubectl -n ingress-nginx get svc -o wide || true
