@@ -27,6 +27,10 @@ on:
         description: "Nama context di kubeconfig"
         required: true
         default: "gha"
+      enable_imperative_api:
+        description: "Aktifkan Imperative API (true/false) — default false biar aman"
+        required: true
+        default: "false"
 
 jobs:
   deploy-rancher:
@@ -37,6 +41,7 @@ jobs:
       INGRESS_CLASS: ${{ inputs.ingress_class }}
       INGRESS_NS: ${{ inputs.ingress_namespace }}
       RANCHER_VERSION: ${{ inputs.rancher_version }}
+      ENABLE_IMPERATIVE: ${{ inputs.enable_imperative_api }}
 
     steps:
       - name: Checkout
@@ -54,6 +59,7 @@ jobs:
 
       - name: Install tools (jq, openssl)
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq openssl
 
@@ -82,11 +88,13 @@ jobs:
 
       - name: Add Helm repo (Rancher)
         run: |
+          set -euo pipefail
           helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
           helm repo update
 
       - name: Ensure namespaces
         run: |
+          set -euo pipefail
           kubectl get ns cattle-system >/dev/null 2>&1 || kubectl create ns cattle-system
 
       # -------------------- GUARDRAILS AWAL --------------------
@@ -125,7 +133,7 @@ jobs:
           done
           # Tunggu controller ready supaya admission & ingress stabil
           kubectl -n "$INGRESS_NS" wait --for=condition=ready pod -l app.kubernetes.io/component=controller --timeout=10m || true
-          # Tinjau endpoints admission (kadang baru kebentuk setelah controller ready)
+          # Cek endpoints admission (kadang baru kebentuk setelah controller ready)
           kubectl -n "$INGRESS_NS" get endpoints ingress-nginx-controller-admission || true
 
       # -------------------- TLS BACKEND (SELF-SIGNED) --------------------
@@ -133,12 +141,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 825 \
             -subj "/CN=${RANCHER_HOSTNAME}" \
             -keyout /tmp/tls.key -out /tmp/tls.crt
           kubectl -n cattle-system delete secret rancher-tls >/dev/null 2>&1 || true
           kubectl -n cattle-system create secret tls rancher-tls \
             --key /tmp/tls.key --cert /tmp/tls.crt
+
+      # -------------------- (OPSIONAL) SERVICE IMPERATIVE API --------------------
+      - name: Ensure Imperative API Service (only if enabled)
+        if: ${{ env.ENABLE_IMPERATIVE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! kubectl -n cattle-system get svc imperative-api-extension >/dev/null 2>&1; then
+            cat <<'YAML' | kubectl apply -f -
+            apiVersion: v1
+            kind: Service
+            metadata:
+              name: imperative-api-extension
+              namespace: cattle-system
+              labels:
+                app: rancher
+            spec:
+              selector:
+                app: rancher
+                release: rancher
+              ports:
+              - name: https
+                port: 443
+                targetPort: 6666
+                protocol: TCP
+            YAML
+          fi
 
       # -------------------- INSTALL / UPGRADE RANCHER --------------------
       - name: Install/Upgrade Rancher (ingress.tls.source=secret)
@@ -154,6 +189,13 @@ jobs:
             VERSION_ARG=""
           fi
 
+          # Build flags dinamis untuk feature Imperative API
+          EXTRA_FLAGS=()
+          if [[ "${ENABLE_IMPERATIVE}" != "true" ]]; then
+            EXTRA_FLAGS+=( --set-string extraEnv[1].name="CATTLE_FEATURES" )
+            EXTRA_FLAGS+=( --set-string extraEnv[1].value="imperative-api-extension=false" )
+          fi
+
           helm upgrade --install rancher "$CHART" \
             --namespace cattle-system ${VERSION_ARG} \
             --set hostname="${RANCHER_HOSTNAME}" \
@@ -166,6 +208,7 @@ jobs:
             --set-string ingress.extraAnnotations."nginx\.ingress\.kubernetes\.io/websocket-services"="rancher" \
             --set-string extraEnv[0].name="CATTLE_PROXY_REAL_IP_HEADER" \
             --set-string extraEnv[0].value="X-Forwarded-For" \
+            "${EXTRA_FLAGS[@]}" \
             ${BOOTSTRAP_PASSWORD:+--set bootstrapPassword="${BOOTSTRAP_PASSWORD}"} \
             --wait --timeout 30m
 
@@ -173,7 +216,7 @@ jobs:
           kubectl -n cattle-system rollout status deploy/rancher --timeout=20m || (kubectl -n cattle-system get pods -o wide; false)
           kubectl -n cattle-system wait deploy/rancher-webhook --for=condition=Available --timeout=10m || true
 
-      # -------------------- RESTORE WEBHOOKS --------------------
+      # -------------------- RESTORE WEBHOOKS (NORMAL POLICY) --------------------
       - name: Restore Rancher webhooks (Fail)
         if: ${{ always() }}
         shell: bash
@@ -214,9 +257,54 @@ jobs:
       - name: Show ingress & services (buat NPM target)
         if: ${{ always() }}
         run: |
+          set -euo pipefail
           echo "== Ingresses =="
-          kubectl get ingress -A
+          kubectl get ingress -A || true
           echo "== Ingress Controller Service (cari LB/MetalLB IP) =="
           kubectl -n "$INGRESS_NS" get svc -o wide || true
           echo "== Rancher svc/ingress detail =="
           kubectl -n cattle-system get svc,ingress -o wide || true
+
+      # -------------------- AUTO CLEANUP ON FAILURE --------------------
+      - name: 🔥 Cleanup (auto-rollback jika gagal)
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== AUTO CLEANUP: mulai rollback semua resource Rancher ==="
+
+          # 1) Uninstall Helm release (cluster-scoped hook akan dihapus juga)
+          if helm -n cattle-system status rancher >/dev/null 2>&1; then
+            helm -n cattle-system uninstall rancher || true
+          fi
+
+          # 2) Hapus webhook configs cluster-scoped (kalau masih tersisa)
+          for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            kubectl delete $kind rancher.cattle.io --ignore-not-found=true || true
+          done
+
+          # 3) Hapus APIService aggregated yang berhubungan (kalau ada)
+          kubectl delete apiservice v1.ext.cattle.io --ignore-not-found=true || true
+
+          # 4) Hapus Service imperative-api-extension (kalau dibuat)
+          kubectl -n cattle-system delete svc imperative-api-extension --ignore-not-found=true || true
+
+          # 5) Hapus secret TLS backend
+          kubectl -n cattle-system delete secret rancher-tls --ignore-not-found=true || true
+
+          # 6) Hapus namespace cattle-system (akan menghapus Deploy/Pods dsb)
+          if kubectl get ns cattle-system >/dev/null 2>&1; then
+            kubectl delete ns cattle-system --ignore-not-found=true || true
+            # Tunggu maksimal 2 menit; kalau belum hilang juga, list finalizers
+            for i in $(seq 1 12); do
+              kubectl get ns cattle-system >/dev/null 2>&1 || break
+              echo "menunggu namespace cattle-system terhapus... ($i/12)"
+              sleep 10
+            done
+          fi
+
+          echo "=== AUTO CLEANUP: selesai. Klaster bersih dari instalasi Rancher job ini. ==="
+
+      - name: ✅ Selesai
+        if: ${{ success() }}
+        run: echo "Deploy Rancher sukses 🚀 — buka https://${{ inputs.rancher_hostname }}"
