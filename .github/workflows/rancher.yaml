@@ -88,7 +88,37 @@ jobs:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
           set -euo pipefail
-          echo "$KUBECONFIG_B64" | base64 -d > $HOME/.kube/config
+          mkdir -p "$HOME/.kube"
+          # Penjelasan AI: logika python berikut mendukung secret kubeconfig dalam format base64 maupun YAML mentah agar workflow fleksibel.
+          python - <<'PY'
+import base64
+import binascii
+import os
+import pathlib
+
+raw_secret = os.environ.get("KUBECONFIG_B64", "")
+if raw_secret.startswith("'") and raw_secret.endswith("'") and len(raw_secret) >= 2:
+    raw_secret = raw_secret[1:-1]
+raw_secret = raw_secret.strip()
+
+target = pathlib.Path(os.environ["HOME"]) / ".kube" / "config"
+target.parent.mkdir(parents=True, exist_ok=True)
+
+content: str
+try:
+    decoded = base64.b64decode(raw_secret)
+    text = decoded.decode("utf-8")
+    if "apiVersion" not in text or "clusters" not in text:
+        raise ValueError("decoded payload does not look like kubeconfig")
+    content = text
+except (binascii.Error, UnicodeDecodeError, ValueError):
+    content = raw_secret
+
+if not content.endswith("\n"):
+    content += "\n"
+
+target.write_text(content)
+PY
           chmod 600 $HOME/.kube/config
           kubectl cluster-info
           kubectl get nodes -o wide
