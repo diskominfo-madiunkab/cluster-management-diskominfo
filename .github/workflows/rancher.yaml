@@ -1,5 +1,20 @@
 name: Deploy Rancher (NodePort via NPM) - One Click
 
+# Penjelasan AI: concurrency mencegah dua proses deployment berjalan bersamaan sehingga konfigurasi cluster tetap konsisten.
+concurrency:
+  group: deploy-rancher-${{ github.ref }}
+  cancel-in-progress: false
+
+# Penjelasan AI: pembatasan permissions menjaga prinsip least-privilege pada workflow.
+permissions:
+  contents: read
+
+# Penjelasan AI: default shell bash memberi kontrol penuh atas pengecekan error di setiap script.
+defaults:
+  run:
+    shell: bash
+
+# Penjelasan AI: workflow dapat dipicu manual maupun otomatis saat ada perubahan di konfigurasi yang relevan.
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +29,8 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - ".github/workflows/deploy-rancher.yml"
+      - ".github/workflows/rancher.yaml"
+      - "k8s/**"
 
 env:
   NAMESPACE: cattle-system
@@ -23,6 +39,7 @@ env:
 
 jobs:
   deploy:
+    name: Deploy Rancher
     runs-on: ubuntu-latest
     env:
       NODEPORT: ${{ github.event.inputs.nodePort || '32080' }}
@@ -31,16 +48,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup kubectl + helm
+      # Penjelasan AI: validasi awal memastikan secret penting tersedia sebelum melanjutkan proses.
+      - name: Validate Rancher secrets
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+          RANCHER_HOSTNAME: ${{ secrets.RANCHER_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_B64:-}" ]]; then
+            echo "Secret KUBECONFIG_B64 belum diset." >&2
+            exit 1
+          fi
+          if [[ -z "${RANCHER_HOSTNAME:-}" ]]; then
+            echo "Secret RANCHER_HOSTNAME belum diset." >&2
+            exit 1
+          fi
+
+      # Penjelasan AI: pemasangan kubectl versi tetap menjaga kompatibilitas dengan cluster target.
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.29.6
+
+      # Penjelasan AI: pemasangan helm menggunakan versi yang teruji untuk release Rancher terbaru.
+      - name: Setup helm
         uses: azure/setup-helm@v4
         with:
           version: v3.15.2
-      - run: kubectl version --client
+
+      # Penjelasan AI: pengecekan versi memastikan tooling berhasil ter-install sebelum mengakses cluster.
+      - name: Validate client tools
+        run: |
+          set -euo pipefail
+          kubectl version --client
+          helm version --short
 
       - name: Restore kubeconfig
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
+          set -euo pipefail
           echo "$KUBECONFIG_B64" | base64 -d > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
           kubectl cluster-info
@@ -48,22 +95,36 @@ jobs:
 
       - name: Ensure namespace
         run: |
+          set -euo pipefail
           kubectl get ns $NAMESPACE >/dev/null 2>&1 || kubectl create ns $NAMESPACE
 
       - name: Add Rancher Helm repo
         run: |
+          set -euo pipefail
           helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
           helm repo update
 
       - name: Pre-clean dangling failed installs (optional)
         run: |
+          set -euo pipefail
           set -x
           helm ls -n $NAMESPACE --all --filter "^${RELEASE}$" | awk 'NR>1 {print $1}' | \
             xargs -r -I{} helm uninstall {} -n $NAMESPACE || true
 
+      # Penjelasan AI: pengecekan ini memastikan NodePort tidak bentrok dengan service lain di cluster.
+      - name: Validate requested NodePort availability
+        run: |
+          set -euo pipefail
+          if kubectl get svc --all-namespaces -o jsonpath='{range .items[*]}{range .spec.ports[*]}{.nodePort}{"\n"}{end}{end}' \
+            | grep -Fxq "$NODEPORT"; then
+            echo "NodePort $NODEPORT sudah digunakan oleh service lain." >&2
+            exit 1
+          fi
+
       - name: Apply NodePort Service (inline)
         run: |
-          # Render & apply Service langsung dari here-doc
+          set -euo pipefail
+          # Penjelasan AI: here-doc digunakan agar manifest service NodePort dapat diterapkan tanpa file terpisah.
           cat <<YAML | kubectl apply -f -
           apiVersion: v1
           kind: Service
@@ -97,12 +158,13 @@ jobs:
             --wait \
             --timeout 15m \
             --set hostname="${RANCHER_HOSTNAME}" \
-            --set replicas="${RANCHER_REPLICAS}" \
+            --set replicas=${RANCHER_REPLICAS} \
             --set ingress.enabled=false \
             --set tls=external
 
       - name: Wait rollout Rancher
         run: |
+          set -euo pipefail
           kubectl -n $NAMESPACE rollout status deploy/rancher --timeout=10m
           kubectl -n $NAMESPACE get pods -o wide
 
@@ -117,6 +179,7 @@ jobs:
 
       - name: Print NodeIPs + NodePort (untuk setting NPM)
         run: |
+          set -euo pipefail
           echo "== Candidate Node IPs =="
           kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\t"}{.metadata.name}{"\n"}{end}'
           echo "NodePort:"
