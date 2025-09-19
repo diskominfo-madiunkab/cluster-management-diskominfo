@@ -41,6 +41,9 @@ jobs:
     env:
       NODEPORT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.nodePort || '32080' }}
       RANCHER_REPLICAS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.replicas || '2' }}
+      # Memperpanjang toleransi startup probe agar bootstrap Rancher tidak dipotong sebelum waktunya.
+      RANCHER_STARTUP_FAILURE_THRESHOLD: '30'
+      RANCHER_STARTUP_TIMEOUT_SECONDS: '10'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -203,6 +206,7 @@ jobs:
           RANCHER_REPLICAS: ${{ env.RANCHER_REPLICAS }}
         run: |
           set -euo pipefail
+          # Memberi waktu lebih lama bagi Rancher untuk bootstrap sehingga startup probe tidak memicu restart prematur.
           helm upgrade --install "$RELEASE" rancher-latest/rancher \
             -n "$NAMESPACE" \
             --wait \
@@ -210,7 +214,9 @@ jobs:
             --set hostname="${RANCHER_HOSTNAME}" \
             --set replicas=${RANCHER_REPLICAS} \
             --set ingress.enabled=false \
-            --set tls=external
+            --set tls=external \
+            --set startupProbe.failureThreshold=${RANCHER_STARTUP_FAILURE_THRESHOLD} \
+            --set startupProbe.timeoutSeconds=${RANCHER_STARTUP_TIMEOUT_SECONDS}
 
       - name: Wait rollout Rancher
         run: |
