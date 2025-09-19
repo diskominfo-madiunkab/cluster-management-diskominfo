@@ -1,11 +1,9 @@
 name: Deploy Rancher (NodePort via NPM) - One Click
 
-# concurrency mencegah dua proses deployment berjalan bersamaan.
 concurrency:
   group: deploy-rancher-${{ github.ref }}
   cancel-in-progress: false
 
-# least-privilege
 permissions:
   contents: read
 
@@ -37,33 +35,23 @@ env:
 
 jobs:
   deploy:
-    # Rekomendasi: runner self-hosted di jaringan yang bisa reach API server & Node IPs.
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
-      # Aman untuk event push (tanpa github.event.inputs)
       NODEPORT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.nodePort || '32080' }}
       RANCHER_REPLICAS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.replicas || '2' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Validasi secrets penting
       - name: Validate Rancher secrets
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
           RANCHER_HOSTNAME: ${{ secrets.RANCHER_HOSTNAME }}
         run: |
           set -euo pipefail
-          if [[ -z "${KUBECONFIG_B64:-}" ]]; then
-            echo "❌ Secret KUBECONFIG_B64 belum diset." >&2
-            exit 1
-          fi
-          if [[ -z "${RANCHER_HOSTNAME:-}" ]]; then
-            echo "❌ Secret RANCHER_HOSTNAME belum diset." >&2
-            exit 1
-          fi
+          [[ -n "${KUBECONFIG_B64:-}" ]] || { echo "❌ Secret KUBECONFIG_B64 belum diset."; exit 1; }
+          [[ -n "${RANCHER_HOSTNAME:-}" ]] || { echo "❌ Secret RANCHER_HOSTNAME belum diset."; exit 1; }
 
-      # Tooling (boleh di-skip kalau runner sudah punya kubectl/helm/jq)
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
@@ -74,14 +62,11 @@ jobs:
         with:
           version: v3.15.2
 
-      - name: Install jq & curl (if missing)
+      - name: Install jq (if missing)
         run: |
           set -euo pipefail
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y jq
-          fi
-          if ! command -v curl >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y curl
           fi
 
       - name: Validate client tools
@@ -91,50 +76,54 @@ jobs:
           helm version --short
           jq --version
 
-      - name: Restore kubeconfig
+      - name: Restore kubeconfig (supports base64 atau YAML mentah)
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.kube"
           python - <<'PY'
-          import base64, binascii, os, pathlib
+          import base64, binascii, os, pathlib, re
           raw = os.environ.get("KUBECONFIG_B64","").strip()
-          if raw.startswith("'") and raw.endswith("'") and len(raw)>=2:
-              raw = raw[1:-1]
+          if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+          raw = raw[1:-1].strip()
+          looks_like_b64 = re.fullmatch(r'[A-Za-z0-9+/=\s]+', raw or '') is not None and 'apiVersion' not in raw
+          if not looks_like_b64 and r'\n' in raw:
+          raw = raw.replace(r'\n','\n')
           target = pathlib.Path(os.environ["HOME"])/".kube"/"config"
           target.parent.mkdir(parents=True, exist_ok=True)
-          try:
-              txt = base64.b64decode(raw).decode("utf-8")
-              if "apiVersion" not in txt or "clusters" not in txt:
-                  raise ValueError("decoded payload not kubeconfig")
-              content = txt
-          except (binascii.Error, UnicodeDecodeError, ValueError):
-              content = raw
-          if not content.endswith("\n"):
-              content += "\n"
+          content = None
+        try:
+          decoded = base64.b64decode(raw)
+          text = decoded.decode('utf-8', errors='strict')
+          if "apiVersion" in text and "clusters" in text:
+              content = text
+          else:
+              raise ValueError("decoded payload not kubeconfig")
+          except Exception:
+          content = raw
+          if content and not content.endswith("\n"):
+          content += "\n"
           target.write_text(content)
           PY
           chmod 600 "$HOME/.kube/config"
-          echo "ℹ️ Kube context:"
-          kubectl config current-context || true
-          echo "ℹ️ Cluster info:"
-          kubectl cluster-info
-          echo "ℹ️ Nodes:"
-          kubectl get nodes -o wide
+          echo "ℹ️ Kube context:" && kubectl config current-context || true
+          echo "ℹ️ Cluster info:" && kubectl cluster-info
+          echo "ℹ️ Nodes:" && kubectl get nodes -o wide
 
       - name: Ensure namespace
         run: |
           set -euo pipefail
           kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$NAMESPACE"
 
-      - name: Add Rancher Helm repo
+      - name: Add Rancher Helm repo (+retry)
         run: |
           set -euo pipefail
           helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
-          helm repo update
+          for i in 1 2 3; do
+            helm repo update && break || { echo "retry $i..."; sleep 3; }
+          done
 
-      # Bersihin release gagal yang nyangkut (optional, aman)
       - name: Pre-clean dangling failed installs
         run: |
           set -euo pipefail
@@ -142,7 +131,6 @@ jobs:
           helm ls -n "$NAMESPACE" --all --filter "^${RELEASE}$" | awk 'NR>1 {print $1}' | \
             xargs -r -I{} helm uninstall {} -n "$NAMESPACE" || true
 
-      # Cari NodePort bebas (fallback kalau bentrok)
       - name: Reserve free NodePort (or use requested)
         id: pick_port
         env:
@@ -156,17 +144,13 @@ jobs:
             if echo "$in_use" | grep -Fxq "$want"; then
               echo "⚠️ NodePort $want sudah dipakai, mencari alternatif..."
             else
-              echo "port=$want" >> "$GITHUB_OUTPUT"
-              exit 0
+              echo "port=$want" >> "$GITHUB_OUTPUT"; exit 0
             fi
           fi
-
-          # cari port kosong
           for p in $(seq 32080 32767); do
             if ! echo "$in_use" | grep -Fxq "$p"; then
               echo "✅ Pakai NodePort $p"
-              echo "port=$p" >> "$GITHUB_OUTPUT"
-              exit 0
+              echo "port=$p" >> "$GITHUB_OUTPUT"; exit 0
             fi
           done
           echo "❌ Tidak menemukan NodePort kosong di range 30000-32767" >&2
@@ -195,8 +179,6 @@ jobs:
                 targetPort: 80
                 nodePort: ${NODEPORT_FINAL}
           YAML
-
-          echo "Service applied. Current status:"
           kubectl -n "$NAMESPACE" get svc rancher-nodeport -o wide
 
       - name: Install/Upgrade Rancher (Ingress off, TLS external)
@@ -220,20 +202,17 @@ jobs:
           kubectl -n "$NAMESPACE" rollout status deploy/rancher --timeout=10m
           kubectl -n "$NAMESPACE" get pods -o wide
 
-      # Healthcheck tanpa port-forward: pastikan semua container Ready
-      - name: Health check (API probe)
+      - name: Health check (API probe, no port-forward)
         run: |
           set -euo pipefail
-          # jumlah container total
-          total_containers=$(kubectl -n "$NAMESPACE" get pods -l app=rancher -o json \
+          total=$(kubectl -n "$NAMESPACE" get pods -l app=rancher -o json \
             | jq '[.items[]?.status.containerStatuses? | length] | add')
-          # jumlah container ready
-          ready_containers=$(kubectl -n "$NAMESPACE" get pods -l app=rancher -o json \
+          ready=$(kubectl -n "$NAMESPACE" get pods -l app=rancher -o json \
             | jq '[.items[]?.status.containerStatuses[]? | select(.ready==true)] | length')
-          echo "Total containers: $total_containers"
-          echo "Ready containers: $ready_containers"
-          if [[ -z "${total_containers}" || -z "${ready_containers}" || "$total_containers" -ne "$ready_containers" ]]; then
-            echo "❌ Rancher belum sehat." >&2
+          echo "Total containers: $total"
+          echo "Ready containers: $ready"
+          if [[ -z "${total}" || -z "${ready}" || "$total" -ne "$ready" ]]; then
+            echo "❌ Rancher belum sehat."
             kubectl -n "$NAMESPACE" get pods -o wide
             kubectl -n "$NAMESPACE" logs deploy/rancher --tail=200 || true
             exit 1
@@ -247,17 +226,14 @@ jobs:
           set -euo pipefail
           echo "== Candidate Node IPs (InternalIP) =="
           kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\t"}{.metadata.name}{"\n"}{end}'
-          echo "NodePort yang aktif:"
-          echo "${NODEPORT_FINAL}"
-
+          echo "NodePort yang aktif: ${NODEPORT_FINAL}"
           echo ""
-          echo "➡️  Arahkan NPM (Cloudflare -> NPM -> NodePort):"
+          echo "➡️  NPM (Cloudflare -> NPM -> NodePort):"
           echo "    - Domain (Host): ${{ secrets.RANCHER_HOSTNAME }}"
-          echo "    - Forward IP    : <salah satu InternalIP di atas>"
+          echo "    - Forward IP    : <pilih salah satu InternalIP di atas>"
           echo "    - Forward Port  : ${NODEPORT_FINAL}"
-          echo "    - SSL Mode      : Full (Strict) di Cloudflare, TLS handled external"
+          echo "    - SSL Mode      : Full (Strict)"
 
-      # ===== AUTO CLEANUP JIKA GAGAL =====
       - name: Cleanup on failure
         if: failure()
         run: |
