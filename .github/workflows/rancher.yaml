@@ -1,20 +1,18 @@
 name: Deploy Rancher (NodePort via NPM) - One Click
 
-# Penjelasan AI: concurrency mencegah dua proses deployment berjalan bersamaan sehingga konfigurasi cluster tetap konsisten.
+# concurrency mencegah dua proses deployment berjalan bersamaan.
 concurrency:
   group: deploy-rancher-${{ github.ref }}
   cancel-in-progress: false
 
-# Penjelasan AI: pembatasan permissions menjaga prinsip least-privilege pada workflow.
+# least-privilege
 permissions:
   contents: read
 
-# Penjelasan AI: default shell bash memberi kontrol penuh atas pengecekan error di setiap script.
 defaults:
   run:
     shell: bash
 
-# Penjelasan AI: workflow dapat dipicu manual maupun otomatis saat ada perubahan di konfigurasi yang relevan.
 on:
   workflow_dispatch:
     inputs:
@@ -29,7 +27,7 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - ".github/workflows/rancher.yaml"
+      - ".github/workflows/deploy-rancher.yml"
       - "k8s/**"
 
 env:
@@ -39,16 +37,17 @@ env:
 
 jobs:
   deploy:
-    name: Deploy Rancher
-    runs-on: ubuntu-latest
+    # Rekomendasi: runner self-hosted di jaringan yang bisa reach API server & Node IPs.
+    runs-on: self-hosted
     env:
-      NODEPORT: ${{ github.event.inputs.nodePort || '32080' }}
-      RANCHER_REPLICAS: ${{ github.event.inputs.replicas || '2' }}
+      # Aman untuk event push (tanpa github.event.inputs)
+      NODEPORT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.nodePort || '32080' }}
+      RANCHER_REPLICAS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.replicas || '2' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Penjelasan AI: validasi awal memastikan secret penting tersedia sebelum melanjutkan proses.
+      # Validasi secrets penting
       - name: Validate Rancher secrets
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
@@ -56,32 +55,41 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${KUBECONFIG_B64:-}" ]]; then
-            echo "Secret KUBECONFIG_B64 belum diset." >&2
+            echo "❌ Secret KUBECONFIG_B64 belum diset." >&2
             exit 1
           fi
           if [[ -z "${RANCHER_HOSTNAME:-}" ]]; then
-            echo "Secret RANCHER_HOSTNAME belum diset." >&2
+            echo "❌ Secret RANCHER_HOSTNAME belum diset." >&2
             exit 1
           fi
 
-      # Penjelasan AI: pemasangan kubectl versi tetap menjaga kompatibilitas dengan cluster target.
+      # Tooling (boleh di-skip kalau runner sudah punya kubectl/helm/jq)
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: v1.29.6
 
-      # Penjelasan AI: pemasangan helm menggunakan versi yang teruji untuk release Rancher terbaru.
       - name: Setup helm
         uses: azure/setup-helm@v4
         with:
           version: v3.15.2
 
-      # Penjelasan AI: pengecekan versi memastikan tooling berhasil ter-install sebelum mengakses cluster.
+      - name: Install jq & curl (if missing)
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+          if ! command -v curl >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y curl
+          fi
+
       - name: Validate client tools
         run: |
           set -euo pipefail
           kubectl version --client
           helm version --short
+          jq --version
 
       - name: Restore kubeconfig
         env:
@@ -89,44 +97,36 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.kube"
-          # Penjelasan AI: logika python berikut mendukung secret kubeconfig dalam format base64 maupun YAML mentah agar workflow fleksibel.
           python - <<'PY'
-import base64
-import binascii
-import os
-import pathlib
-
-raw_secret = os.environ.get("KUBECONFIG_B64", "")
-if raw_secret.startswith("'") and raw_secret.endswith("'") and len(raw_secret) >= 2:
-    raw_secret = raw_secret[1:-1]
-raw_secret = raw_secret.strip()
-
-target = pathlib.Path(os.environ["HOME"]) / ".kube" / "config"
-target.parent.mkdir(parents=True, exist_ok=True)
-
-content: str
-try:
-    decoded = base64.b64decode(raw_secret)
-    text = decoded.decode("utf-8")
-    if "apiVersion" not in text or "clusters" not in text:
-        raise ValueError("decoded payload does not look like kubeconfig")
-    content = text
-except (binascii.Error, UnicodeDecodeError, ValueError):
-    content = raw_secret
-
-if not content.endswith("\n"):
-    content += "\n"
-
-target.write_text(content)
-PY
-          chmod 600 $HOME/.kube/config
+          import base64, binascii, os, pathlib
+          raw = os.environ.get("KUBECONFIG_B64","").strip()
+          if raw.startswith("'") and raw.endswith("'") and len(raw)>=2:
+              raw = raw[1:-1]
+          target = pathlib.Path(os.environ["HOME"])/".kube"/"config"
+          target.parent.mkdir(parents=True, exist_ok=True)
+          try:
+              txt = base64.b64decode(raw).decode("utf-8")
+              if "apiVersion" not in txt or "clusters" not in txt:
+                  raise ValueError("decoded payload not kubeconfig")
+              content = txt
+          except (binascii.Error, UnicodeDecodeError, ValueError):
+              content = raw
+          if not content.endswith("\n"):
+              content += "\n"
+          target.write_text(content)
+          PY
+          chmod 600 "$HOME/.kube/config"
+          echo "ℹ️ Kube context:"
+          kubectl config current-context || true
+          echo "ℹ️ Cluster info:"
           kubectl cluster-info
+          echo "ℹ️ Nodes:"
           kubectl get nodes -o wide
 
       - name: Ensure namespace
         run: |
           set -euo pipefail
-          kubectl get ns $NAMESPACE >/dev/null 2>&1 || kubectl create ns $NAMESPACE
+          kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$NAMESPACE"
 
       - name: Add Rancher Helm repo
         run: |
@@ -134,27 +134,49 @@ PY
           helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
           helm repo update
 
-      - name: Pre-clean dangling failed installs (optional)
+      # Bersihin release gagal yang nyangkut (optional, aman)
+      - name: Pre-clean dangling failed installs
         run: |
           set -euo pipefail
           set -x
-          helm ls -n $NAMESPACE --all --filter "^${RELEASE}$" | awk 'NR>1 {print $1}' | \
-            xargs -r -I{} helm uninstall {} -n $NAMESPACE || true
+          helm ls -n "$NAMESPACE" --all --filter "^${RELEASE}$" | awk 'NR>1 {print $1}' | \
+            xargs -r -I{} helm uninstall {} -n "$NAMESPACE" || true
 
-      # Penjelasan AI: pengecekan ini memastikan NodePort tidak bentrok dengan service lain di cluster.
-      - name: Validate requested NodePort availability
+      # Cari NodePort bebas (fallback kalau bentrok)
+      - name: Reserve free NodePort (or use requested)
+        id: pick_port
+        env:
+          REQ: ${{ env.NODEPORT }}
         run: |
           set -euo pipefail
-          if kubectl get svc --all-namespaces -o jsonpath='{range .items[*]}{range .spec.ports[*]}{.nodePort}{"\n"}{end}{end}' \
-            | grep -Fxq "$NODEPORT"; then
-            echo "NodePort $NODEPORT sudah digunakan oleh service lain." >&2
-            exit 1
+          in_use="$(kubectl get svc --all-namespaces -o json \
+            | jq -r '.items[]?.spec.ports[]?.nodePort' | grep -E '^[0-9]+$' || true)"
+          want="${REQ:-32080}"
+          if [[ -n "$want" && "$want" =~ ^[0-9]+$ && "$want" -ge 30000 && "$want" -le 32767 ]]; then
+            if echo "$in_use" | grep -Fxq "$want"; then
+              echo "⚠️ NodePort $want sudah dipakai, mencari alternatif..."
+            else
+              echo "port=$want" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
+          # cari port kosong
+          for p in $(seq 32080 32767); do
+            if ! echo "$in_use" | grep -Fxq "$p"; then
+              echo "✅ Pakai NodePort $p"
+              echo "port=$p" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "❌ Tidak menemukan NodePort kosong di range 30000-32767" >&2
+          exit 1
+
       - name: Apply NodePort Service (inline)
+        env:
+          NODEPORT_FINAL: ${{ steps.pick_port.outputs.port }}
         run: |
           set -euo pipefail
-          # Penjelasan AI: here-doc digunakan agar manifest service NodePort dapat diterapkan tanpa file terpisah.
           cat <<YAML | kubectl apply -f -
           apiVersion: v1
           kind: Service
@@ -171,11 +193,11 @@ PY
               - name: http
                 port: 80
                 targetPort: 80
-                nodePort: ${NODEPORT}
+                nodePort: ${NODEPORT_FINAL}
           YAML
 
           echo "Service applied. Current status:"
-          kubectl -n $NAMESPACE get svc rancher-nodeport -o wide
+          kubectl -n "$NAMESPACE" get svc rancher-nodeport -o wide
 
       - name: Install/Upgrade Rancher (Ingress off, TLS external)
         env:
@@ -183,10 +205,10 @@ PY
           RANCHER_REPLICAS: ${{ env.RANCHER_REPLICAS }}
         run: |
           set -euo pipefail
-          helm upgrade --install $RELEASE rancher-latest/rancher \
-            -n $NAMESPACE \
+          helm upgrade --install "$RELEASE" rancher-latest/rancher \
+            -n "$NAMESPACE" \
             --wait \
-            --timeout 15m \
+            --timeout 20m \
             --set hostname="${RANCHER_HOSTNAME}" \
             --set replicas=${RANCHER_REPLICAS} \
             --set ingress.enabled=false \
@@ -195,36 +217,57 @@ PY
       - name: Wait rollout Rancher
         run: |
           set -euo pipefail
-          kubectl -n $NAMESPACE rollout status deploy/rancher --timeout=10m
-          kubectl -n $NAMESPACE get pods -o wide
+          kubectl -n "$NAMESPACE" rollout status deploy/rancher --timeout=10m
+          kubectl -n "$NAMESPACE" get pods -o wide
 
-      - name: Health check (port-forward → /healthz)
-        run: |
-          set -e
-          kubectl -n $NAMESPACE port-forward deploy/rancher 8080:80 >/tmp/pf.log 2>&1 &
-          PF_PID=$!
-          sleep 3
-          curl -fsS http://127.0.0.1:8080/healthz
-          kill $PF_PID || true
-
-      - name: Print NodeIPs + NodePort (untuk setting NPM)
+      # Healthcheck tanpa port-forward: pastikan semua container Ready
+      - name: Health check (API probe)
         run: |
           set -euo pipefail
-          echo "== Candidate Node IPs =="
+          # jumlah container total
+          total_containers=$(kubectl -n "$NAMESPACE" get pods -l app=rancher -o json \
+            | jq '[.items[]?.status.containerStatuses? | length] | add')
+          # jumlah container ready
+          ready_containers=$(kubectl -n "$NAMESPACE" get pods -l app=rancher -o json \
+            | jq '[.items[]?.status.containerStatuses[]? | select(.ready==true)] | length')
+          echo "Total containers: $total_containers"
+          echo "Ready containers: $ready_containers"
+          if [[ -z "${total_containers}" || -z "${ready_containers}" || "$total_containers" -ne "$ready_containers" ]]; then
+            echo "❌ Rancher belum sehat." >&2
+            kubectl -n "$NAMESPACE" get pods -o wide
+            kubectl -n "$NAMESPACE" logs deploy/rancher --tail=200 || true
+            exit 1
+          fi
+          echo "✅ Rancher sehat."
+
+      - name: Print NodeIPs + NodePort (untuk setting NPM)
+        env:
+          NODEPORT_FINAL: ${{ steps.pick_port.outputs.port }}
+        run: |
+          set -euo pipefail
+          echo "== Candidate Node IPs (InternalIP) =="
           kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\t"}{.metadata.name}{"\n"}{end}'
-          echo "NodePort:"
-          kubectl -n $NAMESPACE get svc rancher-nodeport -o jsonpath='{.spec.ports[0].nodePort}'; echo
+          echo "NodePort yang aktif:"
+          echo "${NODEPORT_FINAL}"
+
+          echo ""
+          echo "➡️  Arahkan NPM (Cloudflare -> NPM -> NodePort):"
+          echo "    - Domain (Host): ${{ secrets.RANCHER_HOSTNAME }}"
+          echo "    - Forward IP    : <salah satu InternalIP di atas>"
+          echo "    - Forward Port  : ${NODEPORT_FINAL}"
+          echo "    - SSL Mode      : Full (Strict) di Cloudflare, TLS handled external"
 
       # ===== AUTO CLEANUP JIKA GAGAL =====
       - name: Cleanup on failure
         if: failure()
         run: |
-          set -x
-          helm uninstall $RELEASE -n $NAMESPACE || true
-          kubectl -n $NAMESPACE delete deploy,sts,ds,svc,ing,job,cm,secret -l app=rancher --force --grace-period=0 || true
-          kubectl -n $NAMESPACE delete all,cm,secret -l app=rancher-webhook --force --grace-period=0 || true
+          set -euxo pipefail
+          echo "🚨 Deployment gagal. Membersihkan resource terkait Rancher..."
+          helm uninstall "$RELEASE" -n "$NAMESPACE" || true
+          kubectl -n "$NAMESPACE" delete deploy,sts,ds,svc,ing,job,cm,secret -l app=rancher --force --grace-period=0 || true
+          kubectl -n "$NAMESPACE" delete all,cm,secret -l app=rancher-webhook --force --grace-period=0 || true
           kubectl -n fleet-system delete all,cm,secret --all || true
           kubectl delete ns fleet-system --force --grace-period=0 || true
-          kubectl -n $NAMESPACE delete svc rancher-nodeport --ignore-not-found=true || true
+          kubectl -n "$NAMESPACE" delete svc rancher-nodeport --ignore-not-found=true || true
           kubectl get crd | awk '/fleet/ {print $1}' | xargs -r kubectl delete crd || true
-          kubectl delete ns $NAMESPACE --force --grace-period=0 || true
+          kubectl delete ns "$NAMESPACE" --force --grace-period=0 || true
