@@ -83,29 +83,40 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/.kube"
           python - <<'PY'
-          import base64, binascii, os, pathlib, re
-          raw = os.environ.get("KUBECONFIG_B64","").strip()
-          if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
-          raw = raw[1:-1].strip()
-          looks_like_b64 = re.fullmatch(r'[A-Za-z0-9+/=\s]+', raw or '') is not None and 'apiVersion' not in raw
-          if not looks_like_b64 and r'\n' in raw:
-          raw = raw.replace(r'\n','\n')
-          target = pathlib.Path(os.environ["HOME"])/".kube"/"config"
-          target.parent.mkdir(parents=True, exist_ok=True)
-          content = None
-        try:
-          decoded = base64.b64decode(raw)
-          text = decoded.decode('utf-8', errors='strict')
-          if "apiVersion" in text and "clusters" in text:
-              content = text
-          else:
-              raise ValueError("decoded payload not kubeconfig")
-          except Exception:
-          content = raw
-          if content and not content.endswith("\n"):
-          content += "\n"
-          target.write_text(content)
-          PY
+import base64, binascii, os, pathlib, re
+
+raw = os.environ.get("KUBECONFIG_B64","").strip()
+
+# Lepas kutip pembungkus kalau ada
+if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+    raw = raw[1:-1].strip()
+
+# Deteksi apakah base64 (tidak mengandung kata kunci kubeconfig)
+looks_like_b64 = re.fullmatch(r'[A-Za-z0-9+/=\s]+', raw or '') is not None and 'apiVersion' not in raw
+
+# Jika bukan base64 dan ada literal "\n", ubah ke newline asli
+if not looks_like_b64 and r'\n' in raw:
+    raw = raw.replace(r'\n','\n')
+
+target = pathlib.Path(os.environ["HOME"])/".kube"/"config"
+target.parent.mkdir(parents=True, exist_ok=True)
+
+content = None
+try:
+    decoded = base64.b64decode(raw)
+            text = decoded.decode('utf-8', errors='strict')
+            if "apiVersion" in text and "clusters" in text:
+                content = text
+            else:
+                raise ValueError("decoded payload not kubeconfig")
+            except Exception:
+                content = raw
+
+            if content and not content.endswith("\n"):
+                content += "\n"
+
+            target.write_text(content)
+            PY
           chmod 600 "$HOME/.kube/config"
           echo "ℹ️ Kube context:" && kubectl config current-context || true
           echo "ℹ️ Cluster info:" && kubectl cluster-info
